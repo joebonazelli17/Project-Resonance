@@ -1,0 +1,30 @@
+# Core API
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.18
+pydantic-settings==2.7.1
+
+# Database
+sqlalchemy[asyncio]==2.0.36
+asyncpg==0.30.0
+alembic==1.14.0
+greenlet==3.1.1
+
+# Storage
+boto3==1.35.81
+
+# Audio engine
+numpy==1.26.4
+scipy==1.13.1
+pandas==2.2.2
+librosa==0.10.2
+soundfile==0.12.1
+pydub==0.25.1
+ffmpeg-python==0.2.0
+faiss-cpu==1.8.0
+tqdm==4.66.4
+certifi>=2024.2.2
+laion-clap==1.1.7
+
+# Misc
+httpx==0.28.1
