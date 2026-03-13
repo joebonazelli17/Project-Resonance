@@ -13,6 +13,8 @@ from app.core.database import async_session
 from app.core.storage import download_to_path
 from app.models.track import Track, TrackSection, TrackStatus
 
+STEM_NAMES = ("drums", "bass", "vocals", "other")
+
 
 async def _update_status(track_id: str, status: TrackStatus, error: str | None = None, **kwargs):
     async with async_session() as db:
@@ -27,8 +29,16 @@ async def _update_status(track_id: str, status: TrackStatus, error: str | None =
             await db.commit()
 
 
+def _embedding_to_bytes(vec: np.ndarray) -> bytes:
+    return vec.astype(np.float32).tobytes()
+
+
+def _bytes_to_embedding(data: bytes) -> np.ndarray:
+    return np.frombuffer(data, dtype=np.float32).copy()
+
+
 def run_analysis(track_id: str) -> None:
-    """Synchronous background task: download from S3, analyze, store sections."""
+    """Full analysis pipeline: beat detection, stems, embeddings, spectral, stereo, labels, energy curves."""
     import asyncio
 
     async def _inner():
@@ -47,13 +57,43 @@ def run_analysis(track_id: str) -> None:
 
                 from app.engine.pipeline import load_mono
                 from app.engine.tempo_bars import detect_beats_bpm_key, slice_by_bars_from_beats
+                from app.engine.embeddings import embed_audio_batch
                 from app.engine.pipeline import _extra_features, _slice_by_bpm_fallback
+                from app.engine.spectral import (
+                    compute_band_energies, compute_energy_curve,
+                    compute_stereo_features, detect_section_label,
+                )
 
                 y, sr = load_mono(local_path)
                 duration_s = float(y.shape[0] / sr) if y.size else 0.0
                 beats, bpm, key, scale, bpb, phase = detect_beats_bpm_key(y, sr)
 
-                sections = []
+                # Track-level energy curve
+                energy_curve = compute_energy_curve(y, sr, hop_s=0.5)
+
+                # Try loading stereo version for stereo analysis
+                y_stereo = None
+                try:
+                    import librosa
+                    y_st, _ = librosa.load(str(local_path), sr=sr, mono=False)
+                    if y_st.ndim == 2 and y_st.shape[0] == 2:
+                        y_stereo = y_st
+                except Exception:
+                    pass
+
+                # Stem separation
+                stems = {}
+                try:
+                    from app.engine.stems import separate_stems
+                    stems = separate_stems(y, sr)
+                except Exception as ex:
+                    print(f"[analyze] Demucs failed, continuing without stems: {ex}")
+
+                # Collect all windows
+                seg_audio = []
+                seg_stem_audio = {name: [] for name in STEM_NAMES}
+                seg_meta = []
+
                 for bars in settings.DEFAULT_BARS_LIST:
                     wins = slice_by_bars_from_beats(
                         beats, bars=bars, hop_bars=settings.DEFAULT_HOP_BARS,
@@ -65,8 +105,8 @@ def run_analysis(track_id: str) -> None:
                             sec_per_bar = (60.0 / float(bpm)) * bpb if bpm else None
                             wins = [
                                 (s, e,
-                                 int([math]::Round(s / sec_per_bar)) if sec_per_bar else 0,
-                                 int([math]::Round(e / sec_per_bar)) if sec_per_bar else 0)
+                                 int(round(s / sec_per_bar)) if sec_per_bar else 0,
+                                 int(round(e / sec_per_bar)) if sec_per_bar else 0)
                                 for (s, e) in wins
                             ]
 
@@ -76,15 +116,66 @@ def run_analysis(track_id: str) -> None:
                         seg = y[s_i:e_i]
                         if seg.shape[0] < sr:
                             continue
-                        feats = _extra_features(seg, sr)
-                        sections.append(TrackSection(
-                            track_id=uuid.UUID(track_id),
-                            start_s=s, end_s=e, bars=bars,
-                            bar_start=b0, bar_end=b1,
-                            bpm=bpm, key=key, scale=scale,
-                            **feats,
-                        ))
 
+                        feats = _extra_features(seg, sr)
+
+                        # Multi-band spectral (#3)
+                        band_e = compute_band_energies(seg, sr)
+
+                        # Stereo width (#6)
+                        stereo_f = None
+                        if y_stereo is not None:
+                            st_seg = y_stereo[:, s_i:e_i]
+                            if st_seg.shape[1] >= sr:
+                                stereo_f = compute_stereo_features(st_seg, sr)
+
+                        # Section label (#5)
+                        import librosa as _lr
+                        onset_env = _lr.onset.onset_strength(y=seg, sr=sr)
+                        onset_d = float(onset_env.mean())
+                        pos_ratio = float(s) / max(duration_s, 1e-6)
+                        label = detect_section_label(
+                            rms_dbfs=feats["rms_dbfs"],
+                            onset_density=onset_d,
+                            hf_perc_ratio=feats["hf_perc_ratio"],
+                            flatness=feats["flatness"],
+                            position_ratio=pos_ratio,
+                            bpm=bpm,
+                        )
+
+                        seg_audio.append(seg)
+                        seg_meta.append({
+                            "start_s": s, "end_s": e, "bars": bars,
+                            "bar_start": b0, "bar_end": b1,
+                            "bpm": bpm, "key": key, "scale": scale,
+                            "section_label": label,
+                            "band_energies": band_e,
+                            "stereo_features": stereo_f,
+                            **feats,
+                        })
+
+                        for name in STEM_NAMES:
+                            if name in stems:
+                                stem_seg = stems[name][s_i:e_i]
+                                seg_stem_audio[name].append(stem_seg if stem_seg.shape[0] >= sr else None)
+                            else:
+                                seg_stem_audio[name].append(None)
+
+                # Embed full-mix
+                mix_embeddings = embed_audio_batch(seg_audio, sr) if seg_audio else None
+
+                # Embed stems
+                stem_embeddings = {}
+                for name in STEM_NAMES:
+                    valid_segs = [(i, s) for i, s in enumerate(seg_stem_audio[name]) if s is not None]
+                    if valid_segs:
+                        indices, segs = zip(*valid_segs)
+                        embs = embed_audio_batch(list(segs), sr)
+                        stem_embeddings[name] = {idx: embs[j] for j, idx in enumerate(indices)}
+                    else:
+                        stem_embeddings[name] = {}
+
+                # Persist
                 async with async_session() as db:
                     result = await db.execute(select(Track).where(Track.id == uuid.UUID(track_id)))
                     track = result.scalar_one_or_none()
@@ -95,9 +186,28 @@ def run_analysis(track_id: str) -> None:
                         track.scale = scale
                         track.beats_per_bar = bpb
                         track.status = TrackStatus.READY
-                        for sec in sections:
-                            db.add(sec)
+                        track.energy_curve = energy_curve
+
+                        for i, meta in enumerate(seg_meta):
+                            mix_emb = _embedding_to_bytes(mix_embeddings[i]) if mix_embeddings is not None else None
+                            drums_emb = _embedding_to_bytes(stem_embeddings["drums"][i]) if i in stem_embeddings.get("drums", {}) else None
+                            bass_emb = _embedding_to_bytes(stem_embeddings["bass"][i]) if i in stem_embeddings.get("bass", {}) else None
+                            vocals_emb = _embedding_to_bytes(stem_embeddings["vocals"][i]) if i in stem_embeddings.get("vocals", {}) else None
+                            other_emb = _embedding_to_bytes(stem_embeddings["other"][i]) if i in stem_embeddings.get("other", {}) else None
+
+                            section = TrackSection(
+                                track_id=uuid.UUID(track_id),
+                                embedding=mix_emb,
+                                embedding_drums=drums_emb,
+                                embedding_bass=bass_emb,
+                                embedding_vocals=vocals_emb,
+                                embedding_other=other_emb,
+                                **meta,
+                            )
+                            db.add(section)
                         await db.commit()
+
+                print(f"[analyze] {track.filename}: {len(seg_meta)} sections, energy_curve={len(energy_curve.get('times', []))} pts")
 
         except Exception as exc:
             await _update_status(track_id, TrackStatus.FAILED, error=str(exc))
@@ -111,7 +221,7 @@ def run_analysis(track_id: str) -> None:
 
 
 async def run_search(query_track_id: str, bars: int = 4, hop_bars: int = 2, k: int = 5):
-    """Run similarity search against the library."""
+    """Run similarity search using real CLAP embeddings."""
     from app.schemas.track import SearchResponse, SearchWindowResult, SearchMatch
 
     async with async_session() as db:
@@ -127,12 +237,23 @@ async def run_search(query_track_id: str, bars: int = 4, hop_bars: int = 2, k: i
     if not lib_tracks:
         return SearchResponse(query_track_id=uuid.UUID(query_track_id), bars=bars, results=[])
 
+    all_sections = []
+    corpus_vecs = []
+    for t in lib_tracks:
+        for sec in t.sections:
+            if sec.bars == bars and sec.embedding is not None:
+                all_sections.append((t, sec))
+                corpus_vecs.append(_bytes_to_embedding(sec.embedding))
+
+    if not all_sections:
+        return SearchResponse(query_track_id=uuid.UUID(query_track_id), bars=bars, results=[])
+
     import tempfile as _tf
     with _tf.TemporaryDirectory() as tmp:
         local_path = Path(tmp) / query_track.filename
         download_to_path(query_track.s3_key, local_path)
 
-        from app.engine.pipeline import load_mono, _extra_features, _slice_by_bpm_fallback
+        from app.engine.pipeline import load_mono, _slice_by_bpm_fallback
         from app.engine.tempo_bars import detect_beats_bpm_key, slice_by_bars_from_beats
         from app.engine.embeddings import embed_audio_batch
         from app.engine.index import build_index
@@ -162,12 +283,7 @@ async def run_search(query_track_id: str, bars: int = 4, hop_bars: int = 2, k: i
             return SearchResponse(query_track_id=uuid.UUID(query_track_id), query_bpm=bpm, query_key=key, bars=bars, results=[])
 
         Q = embed_audio_batch(q_segments, sr).astype(np.float32)
-        all_sections = [(t, sec) for t in lib_tracks for sec in t.sections if sec.bars == bars]
-
-        if not all_sections:
-            return SearchResponse(query_track_id=uuid.UUID(query_track_id), query_bpm=bpm, query_key=key, bars=bars, results=[])
-
-        C = np.zeros((len(all_sections), 512), dtype=np.float32)
+        C = np.stack(corpus_vecs).astype(np.float32)
         index = build_index(C)
         k_real = min(k, len(all_sections))
         sims, ids = index.search(Q, k_real)

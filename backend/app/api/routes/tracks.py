@@ -12,7 +12,7 @@ from app.core.config import settings
 from app.core.database import get_db
 from app.core.storage import upload_file, generate_presigned_url, delete_file
 from app.models.track import Track, TrackStatus
-from app.schemas.track import TrackOut, TrackDetailOut
+from app.schemas.track import TrackOut, TrackDetailOut, TrackWithCurveOut
 from app.workers.analyze import run_analysis
 
 router = APIRouter(prefix="/tracks", tags=["tracks"])
@@ -73,6 +73,16 @@ async def get_track(track_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
     result = await db.execute(
         select(Track).options(selectinload(Track.sections)).where(Track.id == track_id)
     )
+    track = result.scalar_one_or_none()
+    if not track:
+        raise HTTPException(404, "Track not found")
+    return track
+
+
+@router.get("/{track_id}/energy", response_model=TrackWithCurveOut)
+async def get_track_energy(track_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
+    """Get a track's energy curve (LUFS, centroid, onset density over time)."""
+    result = await db.execute(select(Track).where(Track.id == track_id))
     track = result.scalar_one_or_none()
     if not track:
         raise HTTPException(404, "Track not found")

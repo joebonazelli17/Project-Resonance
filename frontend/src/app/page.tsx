@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState, useCallback } from "react";
+import Link from "next/link";
 import { listTracks, uploadTrack, deleteTrack, type Track } from "@/lib/api";
 
 function StatusBadge({ status }: { status: string }) {
@@ -102,7 +103,7 @@ export default function LibraryPage() {
             key={track.id}
             className="flex items-center justify-between bg-zinc-900/50 border border-zinc-800 rounded-lg px-5 py-4 hover:bg-zinc-800/50 transition-colors group"
           >
-            <div className="flex items-center gap-4 min-w-0">
+            <Link href={`/tracks/${track.id}`} className="flex items-center gap-4 min-w-0 flex-1">
               <div className="w-10 h-10 rounded-lg bg-resonance-600/20 flex items-center justify-center flex-shrink-0">
                 <svg className="w-5 h-5 text-resonance-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19V6l12-3v13M9 19c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zm12-3c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zM9 10l12-3" />
@@ -116,7 +117,7 @@ export default function LibraryPage() {
                   {track.duration_s && <span>{Math.floor(track.duration_s / 60)}:{String(Math.floor(track.duration_s % 60)).padStart(2, "0")}</span>}
                 </div>
               </div>
-            </div>
+            </Link>
             <div className="flex items-center gap-3">
               <StatusBadge status={track.status} />
               <button

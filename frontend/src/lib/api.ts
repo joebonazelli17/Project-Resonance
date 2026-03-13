@@ -31,6 +31,21 @@ export interface TrackSection {
   peak_dbfs: number;
   crest_db: number;
   flatness: number;
+  section_label: string | null;
+  band_energies: Record<string, number> | null;
+  stereo_features: { correlation: number; mid_side_ratio: number; width_by_band: Record<string, number> } | null;
+}
+
+export interface EnergyCurve {
+  times: number[];
+  lufs: number[];
+  centroid: number[];
+  onset_density: number[];
+  low_ratio: number[];
+}
+
+export interface TrackWithCurve extends Track {
+  energy_curve: EnergyCurve | null;
 }
 
 export interface TrackDetail extends Track {
@@ -95,6 +110,14 @@ export async function deleteTrack(id: string): Promise<void> {
   await request(`/tracks/${id}`, { method: "DELETE" });
 }
 
+export async function getTrackEnergy(id: string): Promise<TrackWithCurve> {
+  return request(`/tracks/${id}/energy`);
+}
+
+export async function compareSections(a: string, b: string): Promise<Record<string, unknown>> {
+  return request(`/search/compare/${a}/${b}`);
+}
+
 export async function getStreamUrl(id: string): Promise<string> {
   const data = await request<{ url: string }>(`/tracks/${id}/stream`);
   return data.url;
@@ -111,6 +134,63 @@ export async function searchSimilar(
   return request(`/search?bars=${bars}&hop_bars=${hopBars}&k=${k}`, {
     method: "POST",
     body: form,
+  });
+}
+
+export interface TextSearchMatch {
+  track_id: string;
+  filename: string;
+  section_id: string;
+  start_s: number;
+  end_s: number;
+  bars: number;
+  bar_start: number;
+  bar_end: number;
+  bpm: number | null;
+  key: string | null;
+  scale: string | null;
+  similarity: number;
+}
+
+export interface TextSearchResponse {
+  query: string;
+  matches: TextSearchMatch[];
+}
+
+export async function searchByText(
+  query: string,
+  bars?: number,
+  k: number = 10
+): Promise<TextSearchResponse> {
+  const params = new URLSearchParams({ q: query, k: String(k) });
+  if (bars) params.set("bars", String(bars));
+  return request(`/search/text?${params}`);
+}
+
+export interface StemWeights {
+  mix: number;
+  drums: number;
+  bass: number;
+  vocals: number;
+  other: number;
+}
+
+export interface StemSearchResponse {
+  query: string;
+  weights: Record<string, number>;
+  matches: TextSearchMatch[];
+}
+
+export async function searchByStems(
+  query: string,
+  weights: StemWeights,
+  bars?: number,
+  k: number = 10
+): Promise<StemSearchResponse> {
+  return request("/search/stems", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query, weights, bars: bars || null, k }),
   });
 }
 

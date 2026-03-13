@@ -4,7 +4,7 @@ import enum
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, Enum, Float, Integer, String, Text, ForeignKey, func
+from sqlalchemy import DateTime, Enum, Float, Integer, JSON, LargeBinary, String, Text, ForeignKey, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -46,6 +46,8 @@ class Track(Base):
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
 
+    energy_curve: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
     sections: Mapped[list[TrackSection]] = relationship(back_populates="track", cascade="all, delete-orphan")
 
 
@@ -71,6 +73,14 @@ class TrackSection(Base):
     crest_db: Mapped[float] = mapped_column(Float, default=0.0)
     flatness: Mapped[float] = mapped_column(Float, default=0.0)
 
-    embedding_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    section_label: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    band_energies: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    stereo_features: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+    embedding: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    embedding_drums: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    embedding_bass: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    embedding_vocals: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    embedding_other: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
 
     track: Mapped[Track] = relationship(back_populates="sections")

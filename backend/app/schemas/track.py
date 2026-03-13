@@ -23,6 +23,10 @@ class TrackOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class TrackWithCurveOut(TrackOut):
+    energy_curve: dict | None = None
+
+
 class TrackSectionOut(BaseModel):
     id: uuid.UUID
     track_id: uuid.UUID
@@ -39,6 +43,9 @@ class TrackSectionOut(BaseModel):
     peak_dbfs: float
     crest_db: float
     flatness: float
+    section_label: str | None = None
+    band_energies: dict | None = None
+    stereo_features: dict | None = None
 
     model_config = {"from_attributes": True}
 
@@ -76,3 +83,36 @@ class SearchResponse(BaseModel):
     query_key: str | None = None
     bars: int
     results: list[SearchWindowResult]
+
+
+class TextSearchMatch(BaseModel):
+    track_id: uuid.UUID
+    filename: str
+    section_id: uuid.UUID
+    start_s: float
+    end_s: float
+    bars: int
+    bar_start: int
+    bar_end: int
+    bpm: float | None = None
+    key: str | None = None
+    scale: str | None = None
+    similarity: float
+
+
+class TextSearchResponse(BaseModel):
+    query: str
+    matches: list[TextSearchMatch]
+
+
+class StemSearchRequest(BaseModel):
+    query: str
+    weights: dict[str, float] = {"mix": 0.2, "drums": 0.3, "bass": 0.2, "vocals": 0.2, "other": 0.1}
+    bars: int | None = None
+    k: int = 10
+
+
+class StemSearchResponse(BaseModel):
+    query: str
+    weights: dict[str, float]
+    matches: list[TextSearchMatch]

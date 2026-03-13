@@ -169,3 +169,52 @@ def embed_audio_batch(segments: list[np.ndarray], sr: int, batch_size: int = 64)
 
     V = np.vstack(out).astype(np.float32)
     return V
+
+
+def build_hybrid_embedding(
+    clap_vec: np.ndarray,
+    hf_perc_ratio: float = 0.0,
+    rms_dbfs: float = -20.0,
+    peak_dbfs: float = -6.0,
+    crest_db: float = 10.0,
+    flatness: float = 0.1,
+    band_energies: dict | None = None,
+) -> np.ndarray:
+    """
+    Build a Diverse Audio Embedding (DAE) by concatenating the L2-normalized
+    CLAP vector with scaled engineered features. Returns (512 + N) float32.
+    """
+    eng_feats = [
+        hf_perc_ratio * 10.0,
+        (rms_dbfs + 40.0) / 40.0,
+        (peak_dbfs + 40.0) / 40.0,
+        crest_db / 20.0,
+        flatness * 10.0,
+    ]
+    if band_energies:
+        from app.engine.spectral import BAND_NAMES
+        for name in BAND_NAMES:
+            eng_feats.append((band_energies.get(name, -96.0) + 96.0) / 96.0)
+
+    eng = np.array(eng_feats, dtype=np.float32)
+    hybrid = np.concatenate([clap_vec.flatten(), eng])
+    hybrid = hybrid / (np.linalg.norm(hybrid) + 1e-12)
+    return hybrid.astype(np.float32)
+
+
+def embed_text(queries: list[str]) -> np.ndarray:
+    """
+    Embed text queries using CLAP's text encoder.
+    Returns (N, 512) float32 L2-normalized vectors in the same space as audio embeddings.
+    """
+    if not queries:
+        return np.zeros((0, 512), dtype=np.float32)
+
+    m = _get_clap()
+
+    with torch.inference_mode():
+        embs = m.get_text_embedding(queries, use_tensor=True)
+        M = embs.detach().float()
+        M = torch.nn.functional.normalize(M, p=2, dim=1)
+
+    return M.cpu().numpy().astype(np.float32)

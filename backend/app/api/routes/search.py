@@ -12,7 +12,7 @@ from app.core.config import settings
 from app.core.database import get_db
 from app.core.storage import upload_file
 from app.models.track import Track, TrackSection, TrackStatus
-from app.schemas.track import SearchResponse
+from app.schemas.track import SearchResponse, TextSearchResponse, TextSearchMatch, StemSearchRequest, StemSearchResponse
 from app.workers.analyze import run_analysis, run_search
 
 router = APIRouter(prefix="/search", tags=["search"])
@@ -51,6 +51,191 @@ async def search_similar(
 
     results = await run_search(str(track_id), bars=bars, hop_bars=hop_bars, k=k)
     return results
+
+
+@router.get("/text", response_model=TextSearchResponse)
+async def search_by_text(
+    q: str = Query(..., min_length=2, max_length=500, description="Natural language description"),
+    bars: int | None = Query(default=None, ge=1, le=32),
+    k: int = Query(default=10, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+):
+    """Search the library by text description using CLAP's shared audio-text embedding space."""
+    import numpy as np
+    from sqlalchemy.orm import selectinload
+    from app.engine.embeddings import embed_text
+    from app.engine.index import build_index
+
+    lib_result = await db.execute(
+        select(Track)
+        .options(selectinload(Track.sections))
+        .where(Track.status == TrackStatus.READY)
+    )
+    lib_tracks = lib_result.scalars().all()
+
+    all_sections = []
+    corpus_vecs = []
+    for t in lib_tracks:
+        for sec in t.sections:
+            if sec.embedding is None:
+                continue
+            if bars is not None and sec.bars != bars:
+                continue
+            all_sections.append((t, sec))
+            corpus_vecs.append(np.frombuffer(sec.embedding, dtype=np.float32).copy())
+
+    if not all_sections:
+        return TextSearchResponse(query=q, matches=[])
+
+    Q = embed_text([q])
+    C = np.stack(corpus_vecs).astype(np.float32)
+    index = build_index(C)
+    k_real = min(k, len(all_sections))
+    sims, ids = index.search(Q, k_real)
+
+    matches = []
+    for rank in range(k_real):
+        idx = int(ids[0][rank])
+        if idx < 0:
+            continue
+        lib_track, lib_sec = all_sections[idx]
+        matches.append(TextSearchMatch(
+            track_id=lib_track.id,
+            filename=lib_track.original_filename,
+            section_id=lib_sec.id,
+            start_s=lib_sec.start_s,
+            end_s=lib_sec.end_s,
+            bars=lib_sec.bars,
+            bar_start=lib_sec.bar_start,
+            bar_end=lib_sec.bar_end,
+            bpm=lib_sec.bpm,
+            key=lib_sec.key,
+            scale=lib_sec.scale,
+            similarity=float(sims[0][rank]),
+        ))
+
+    return TextSearchResponse(query=q, matches=matches)
+
+
+@router.post("/stems", response_model=StemSearchResponse)
+async def search_by_stems(
+    body: StemSearchRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Search with per-stem weighted similarity. Upload a query text or provide weights."""
+    import numpy as np
+    from app.engine.embeddings import embed_text
+    from app.engine.index import build_index
+
+    weights = body.weights
+    w_total = sum(weights.values())
+    if w_total <= 0:
+        raise HTTPException(400, "At least one stem weight must be > 0")
+    weights = {k: v / w_total for k, v in weights.items()}
+
+    stem_col_map = {
+        "mix": "embedding",
+        "drums": "embedding_drums",
+        "bass": "embedding_bass",
+        "vocals": "embedding_vocals",
+        "other": "embedding_other",
+    }
+
+    lib_result = await db.execute(
+        select(Track).options(selectinload(Track.sections)).where(Track.status == TrackStatus.READY)
+    )
+    lib_tracks = lib_result.scalars().all()
+
+    all_sections = []
+    for t in lib_tracks:
+        for sec in t.sections:
+            if body.bars is not None and sec.bars != body.bars:
+                continue
+            if sec.embedding is None:
+                continue
+            all_sections.append((t, sec))
+
+    if not all_sections:
+        return StemSearchResponse(query=body.query, weights=weights, matches=[])
+
+    Q_text = embed_text([body.query])
+
+    scores = np.zeros(len(all_sections), dtype=np.float32)
+    for stem_name, w in weights.items():
+        if w <= 0:
+            continue
+        col = stem_col_map.get(stem_name, f"embedding_{stem_name}")
+        vecs = []
+        for _, sec in all_sections:
+            emb_data = getattr(sec, col, None) if col != "embedding" else sec.embedding
+            if emb_data is not None:
+                vecs.append(np.frombuffer(emb_data, dtype=np.float32).copy())
+            else:
+                vecs.append(np.zeros(512, dtype=np.float32))
+
+        C = np.stack(vecs).astype(np.float32)
+        sims = (C @ Q_text[0]) / (np.linalg.norm(C, axis=1) * np.linalg.norm(Q_text[0]) + 1e-12)
+        scores += w * sims
+
+    top_k = min(body.k, len(all_sections))
+    top_indices = np.argsort(scores)[::-1][:top_k]
+
+    matches = []
+    for idx in top_indices:
+        lib_track, lib_sec = all_sections[int(idx)]
+        matches.append(TextSearchMatch(
+            track_id=lib_track.id,
+            filename=lib_track.original_filename,
+            section_id=lib_sec.id,
+            start_s=lib_sec.start_s,
+            end_s=lib_sec.end_s,
+            bars=lib_sec.bars,
+            bar_start=lib_sec.bar_start,
+            bar_end=lib_sec.bar_end,
+            bpm=lib_sec.bpm,
+            key=lib_sec.key,
+            scale=lib_sec.scale,
+            similarity=float(scores[int(idx)]),
+        ))
+
+    return StemSearchResponse(query=body.query, weights=weights, matches=matches)
+
+
+@router.get("/compare/{section_a_id}/{section_b_id}")
+async def compare_sections(
+    section_a_id: uuid.UUID,
+    section_b_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    """Compare spectral + stereo profiles of two sections. Returns per-band dB deltas and stereo diff."""
+    from app.engine.spectral import BAND_NAMES
+
+    result_a = await db.execute(select(TrackSection).where(TrackSection.id == section_a_id))
+    result_b = await db.execute(select(TrackSection).where(TrackSection.id == section_b_id))
+    sec_a = result_a.scalar_one_or_none()
+    sec_b = result_b.scalar_one_or_none()
+    if not sec_a or not sec_b:
+        raise HTTPException(404, "Section not found")
+
+    bands_a = sec_a.band_energies or {}
+    bands_b = sec_b.band_energies or {}
+    spectral_delta = {name: round(bands_a.get(name, -96) - bands_b.get(name, -96), 2) for name in BAND_NAMES}
+
+    stereo_a = sec_a.stereo_features or {}
+    stereo_b = sec_b.stereo_features or {}
+
+    return {
+        "section_a": str(section_a_id),
+        "section_b": str(section_b_id),
+        "spectral_delta_db": spectral_delta,
+        "stereo_a": stereo_a,
+        "stereo_b": stereo_b,
+        "dynamics_delta": {
+            "rms_dbfs": round(sec_a.rms_dbfs - sec_b.rms_dbfs, 2),
+            "peak_dbfs": round(sec_a.peak_dbfs - sec_b.peak_dbfs, 2),
+            "crest_db": round(sec_a.crest_db - sec_b.crest_db, 2),
+        },
+    }
 
 
 @router.get("/library/stats")
