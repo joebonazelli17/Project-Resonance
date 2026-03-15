@@ -32,7 +32,10 @@ export interface TrackSection {
   crest_db: number;
   flatness: number;
   section_label: string | null;
+  section_label_confidence: number | null;
   band_energies: Record<string, number> | null;
+  band_crest: Record<string, number> | null;
+  band_transient_density: Record<string, number> | null;
   stereo_features: { correlation: number; mid_side_ratio: number; width_by_band: Record<string, number> } | null;
 }
 
@@ -114,7 +117,32 @@ export async function getTrackEnergy(id: string): Promise<TrackWithCurve> {
   return request(`/tracks/${id}/energy`);
 }
 
-export async function compareSections(a: string, b: string): Promise<Record<string, unknown>> {
+export interface ComparisonRecommendation {
+  band?: string;
+  freq_range?: string;
+  type: string;
+  message: string;
+  severity: string;
+}
+
+export interface ComparisonResult {
+  section_a: string;
+  section_b: string;
+  mastering_state_a: string;
+  mastering_state_b: string;
+  mastering_mismatch: boolean;
+  spectral_shape_delta: Record<string, number>;
+  band_crest_a: Record<string, number>;
+  band_crest_b: Record<string, number>;
+  transient_density_a: Record<string, number>;
+  transient_density_b: Record<string, number>;
+  stereo_a: Record<string, unknown>;
+  stereo_b: Record<string, unknown>;
+  dynamics_delta: { rms_dbfs: number; peak_dbfs: number; crest_db: number };
+  recommendations: ComparisonRecommendation[];
+}
+
+export async function compareSections(a: string, b: string): Promise<ComparisonResult> {
   return request(`/search/compare/${a}/${b}`);
 }
 

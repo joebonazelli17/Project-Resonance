@@ -56,6 +56,8 @@ export default function WaveformPlayer({
   sectionsRef.current = sections;
   const onSectionClickRef = useRef(onSectionClick);
   onSectionClickRef.current = onSectionClick;
+  const activeSectionIdRef = useRef(activeSectionId);
+  activeSectionIdRef.current = activeSectionId;
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -144,6 +146,20 @@ export default function WaveformPlayer({
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [audioUrl]);
+
+  useEffect(() => {
+    const regions = regionsRef.current;
+    if (!regions || !ready) return;
+    const allRegions = regions.getRegions();
+    for (const region of allRegions) {
+      if (region.id.startsWith("hl-")) continue;
+      const sec = sectionsRef.current.find((s) => s.id === region.id);
+      if (!sec) continue;
+      const baseColor = SECTION_COLORS[sec.bars % SECTION_COLORS.length] || SECTION_COLORS[0];
+      const newColor = activeSectionId === sec.id ? "rgba(92, 124, 250, 0.35)" : baseColor;
+      region.setOptions({ color: newColor });
+    }
+  }, [activeSectionId, ready]);
 
   const togglePlay = useCallback(() => {
     if (wsRef.current) wsRef.current.playPause();

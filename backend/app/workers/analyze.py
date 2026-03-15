@@ -79,12 +79,17 @@ def run_analysis(track_id: str) -> None:
             )
             import librosa as _lr
 
+            # Load raw audio first for mastering detection (before normalization)
+            import librosa as _lr_raw
+            y_raw, sr = _lr_raw.load(str(local_path), sr=44100, mono=True)
+            mastering_state = detect_mastering_state(y_raw, sr)
+            del y_raw
+
             y, sr = load_mono(local_path)
             duration_s = float(y.shape[0] / sr) if y.size else 0.0
             beats, bpm, key, scale, bpb, phase = detect_beats_bpm_key(y, sr)
 
             energy_curve = compute_energy_curve(y, sr, hop_s=0.5)
-            mastering_state = detect_mastering_state(y, sr)
 
             y_stereo = None
             try:

@@ -142,42 +142,7 @@ def _slice_by_bpm_fallback(bpm: float, duration_s: float, bars: int, hop_bars: i
         t += hop
     return out
 
-# def _eq_profile(y: np.ndarray, sr: int, n_bands: int = 24) -> np.ndarray:
-#     """
-#     Average log-mel 'EQ' over time for a segment.
-#     Returns a L2-normalized n_bands vector (float32).
-#     """
-#     # Use mel bands as coarse EQ; center=False to respect your beat-aligned slices
-#     S = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=n_bands, power=2.0, center=False)
-#     v = np.log1p(S).mean(axis=1)                    # time-average
-#     v = v / (np.linalg.norm(v) + 1e-12)             # L2 normalize
-#     return v.astype(np.float32)
-
-def _eq_profile(y: np.ndarray, sr: int, n_bands: int = 64) -> np.ndarray:
-    """
-    64-band log-mel 'EQ' with temporal and spectral smoothing.
-    Returns an L2-normalized vector (float32).
-    """
-    S = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=n_bands, power=2.0, center=False)
-    M = np.log1p(S)
-
-    # Temporal smoothing across time frames
-    if M.shape[1] >= 3:
-        w_t = 5
-        k_t = np.ones(w_t, dtype=np.float32) / w_t
-        M = np.apply_along_axis(lambda x: np.convolve(x, k_t, mode="same"), axis=1, arr=M)
-
-    v = M.mean(axis=1)
-
-    # Spectral smoothing across adjacent bands
-    if v.size >= 3:
-        w_f = 3
-        k_f = np.ones(w_f, dtype=np.float32) / w_f
-        v = np.convolve(v, k_f, mode="same")
-
-    v = v.astype(np.float32, copy=False)
-    v /= (np.linalg.norm(v) + 1e-12)
-    return v
+from app.engine.spectral import compute_eq_profile as _eq_profile
 
 def _extra_features(y: np.ndarray, sr: int) -> dict:
     """Compute quick tonal/compression cues for gating & analysis."""
@@ -295,34 +260,6 @@ def _dedup_per_track(
     )
     return res
 
-
-# def _dedup_per_track(out: pd.DataFrame, iou_thresh: float = 0.5, eq_weight: float = 0.0) -> pd.DataFrame:
-#     if out.empty: 
-#         return out
-#     rows = []
-#     for fname, g in out.groupby("match_file", sort=False):
-#         key_col = "blend" if eq_weight > 0.0 and "blend" in g.columns else "sim"
-#         g = g.sort_values(key_col, ascending=False).reset_index(drop=True)
-#         #g = g.sort_values("sim", ascending=False).reset_index(drop=True)
-#         keep = []
-#         used = np.zeros(len(g), dtype=bool)
-#         # IoU over (m_start, m_end)
-#         for i in range(len(g)):
-#             if used[i]: 
-#                 continue
-#             keep.append(i)
-#             s1, e1 = g.iloc[i][["m_start", "m_end"]]
-#             for j in range(i + 1, len(g)):
-#                 if used[j]: 
-#                     continue
-#                 s2, e2 = g.iloc[j][["m_start", "m_end"]]
-#                 inter = max(0.0, min(e1, e2) - max(s1, s2))
-#                 union = (e1 - s1) + (e2 - s2) - inter + 1e-9
-#                 iou = inter / union
-#                 if iou >= iou_thresh:
-#                     used[j] = True
-#         rows.append(g.loc[keep])
-#     return pd.concat(rows, ignore_index=True)
 
 def ingest_corpus(
     corpus_dir: Path,
@@ -459,8 +396,6 @@ def ingest_corpus(
                             int(round(e / sec_per_bar)) if sec_per_bar else 0)
                             for (s, e) in wins
                         ]
-                #wins = slice_by_bars_from_beats(beats, bars=bars, hop_bars=hop_bars, beats_per_bar=beats_per_bar)
-
                 batch_segments = []
                 batch_rows = []
 
@@ -485,7 +420,6 @@ def ingest_corpus(
                     if seg.shape[0] < sr:
                         continue
 
-                    #feats_eq = _eq_profile(seg, sr)
                     feats_extra = _extra_features(seg, sr)
                     sec_per_bar = (60.0 / bpm) * bpb if bpm else np.nan
 
@@ -536,9 +470,6 @@ def ingest_corpus(
 
     index = build_index(X)   # no faiss_threads arg
     print(f"[ingest] FAISS built in {time.time()-t:.2f}s", flush=True)
-    t = time.time()
-    # Build & save index
-    print(f"[ingest] FAISS built in {time.time()-t:.2f}s", flush=True)
     print("[ingest] writing index & meta ...", flush=True)
     t = time.time()
     np.save(cache["X"], X)
@@ -565,8 +496,6 @@ def ingest_corpus(
     return index, df, X, indices_by_bars, rowids_by_bars
 
 
-# def query_file(query_fp: Path, index, df_corpus: pd.DataFrame, X: np.ndarray,
-#                bars=16, hop_bars=8, k=5, beats_per_bar=4):
 def query_file(query_fp: Path, index, df_corpus: pd.DataFrame, X: np.ndarray,
                bars=16, hop_bars=8, k=5, beats_per_bar=4,
                eq_weight: float = 0.0, eq_bands: int = 24,
@@ -577,7 +506,6 @@ def query_file(query_fp: Path, index, df_corpus: pd.DataFrame, X: np.ndarray,
 
     y, sr = load_mono(query_fp)
     duration_s = y.shape[0] / float(sr) if y.size else 0.0
-    #beats, bpm, key, scale = detect_beats_bpm_key(y, sr)
     beats, bpm, key, scale, bpb, phase = detect_beats_bpm_key(y, sr)
 
     wins = slice_by_bars_from_beats(
@@ -736,7 +664,6 @@ def query_file(query_fp: Path, index, df_corpus: pd.DataFrame, X: np.ndarray,
         return out.sort_values(["q_start","blend","sim"], ascending=[True, False, False]).reset_index(drop=True)
     else:
         return out.sort_values(["q_start","sim"], ascending=[True, False]).reset_index(drop=True)
-    #return out.sort_values(["q_start","sim"], ascending=[True, False]).reset_index(drop=True)
 
 
 def _cli():
@@ -745,7 +672,6 @@ def _cli():
     ap.add_argument("--no-cache", action="store_true")
     ap.add_argument("--rebuild-index", action="store_true")
     ap.add_argument("--corpus", default="data/corpus", type=str)
-    #ap.add_argument("--query",  default="data/query.mp3", type=str)
     # positional (optional) query path, e.g. `python -m app.pipeline data/aud.wav`
     ap.add_argument("query_pos", nargs="?", help="Path to the query audio file")
     # flag variant, e.g. `--query data/aud.wav` or `-q data/aud.wav`
@@ -762,7 +688,6 @@ def _cli():
     args = ap.parse_args()
 
     corpus_dir = Path(args.corpus)
-    #query_fp   = Path(args.query)
     query_path = args.query_opt or args.query_pos or "data/query.mp3"
     query_fp   = Path(query_path)
     if not corpus_dir.exists():
@@ -804,9 +729,6 @@ def _cli():
 
 
     out = pd.concat(all_out, ignore_index=True) if all_out else pd.DataFrame()
-    # if not out.empty:
-    #     out = _dedup_per_track(out, iou_thresh=0.5, eq_weight=args.eq_weight)
-
     if out.empty:
         print("No results. Try a different bars/hop or add more corpus tracks.")
     else:
@@ -823,7 +745,6 @@ def _cli():
         if args.eq_weight > 0.0:
             cols_show = base_cols + ["eq_sim","blend"]
             sort_cols = ["q_start", "blend", "sim"]
-            #sort_cols = ["blend", "q_start", "sim"]
             ascending = [True, False, False]
         else:
             cols_show = base_cols

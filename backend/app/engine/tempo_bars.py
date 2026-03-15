@@ -167,55 +167,6 @@ def slice_by_bars_from_beats(
         i += hop_bars
     return out
 
-# def slice_by_bars_from_beats(
-#     beats_sec: np.ndarray,
-#     bars: int,
-#     hop_bars: int = 8,
-#     beats_per_bar: int = 4,
-#     phase_offset: int = 0,
-# ) -> List[Tuple[float, float]]:
-#     """
-#     Highest-quality bar slicing:
-#     - Uses downbeat phase (phase_offset) to align true bars.
-#     - Synthesizes end boundary for exact-N-bar windows near the tail.
-#     - Clamps to sensible last time (+1 beat).
-#     """
-#     beats = np.asarray(beats_sec, dtype=float)
-#     if beats.size < max(beats_per_bar, 2):
-#         return []
-
-#     # bar boundaries aligned with phase
-#     bars_bound = beats[phase_offset::beats_per_bar]
-#     if bars_bound.size < 1:
-#         return []
-
-#     # robust beat duration
-#     beat_dur = float(np.median(np.diff(beats))) if beats.size >= 2 else 60.0 / 120.0
-#     sec_per_bar = beat_dur * beats_per_bar
-
-#     out: List[Tuple[float, float]] = []
-#     i = 0
-#     last_time = float(beats[-1] + beat_dur)  # one more beat past last
-
-#     while i < bars_bound.size:
-#         s = float(bars_bound[i])
-
-#         if i + bars < bars_bound.size:
-#             e = float(bars_bound[i + bars])
-#         else:
-#             # synthesize the exact N-bar boundary
-#             e = s + bars * sec_per_bar
-#             e = min(e, last_time)
-
-#         if e > s:
-#             out.append((s, e))
-
-#         i += hop_bars
-#         if i >= bars_bound.size:
-#             break
-
-#     return out
-
 
 # -----------------------------
 # Public API (drop-in)
@@ -298,7 +249,7 @@ def sections_from_audio(
             beats_per_bar=bpb,
             phase_offset=phase,
         )
-        for (s, e) in wins:
+        for (s, e, b0, b1) in wins:
             s_i, e_i = int(round(s * sr)), int(round(e * sr))
             out.append(
                 (s_i, e_i, SectionMeta(start_s=s, end_s=e, bars=bars, bpm=bpm, key=key, scale=scale))

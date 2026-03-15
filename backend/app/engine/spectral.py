@@ -93,16 +93,23 @@ def compute_band_transient_density(y: np.ndarray, sr: int) -> dict[str, float]:
     if duration < 0.1:
         return {name: 0.0 for name in BAND_NAMES}
 
-    S = np.abs(librosa.stft(y, n_fft=4096, hop_length=512))
+    hop_length = 512
+    S = np.abs(librosa.stft(y, n_fft=4096, hop_length=hop_length))
     freqs = librosa.fft_frequencies(sr=sr, n_fft=4096)
     result = {}
     for i, name in enumerate(BAND_NAMES):
         lo, hi = BAND_EDGES_HZ[i], BAND_EDGES_HZ[i + 1]
         mask = (freqs >= lo) & (freqs < hi)
         if mask.any():
-            band_energy = S[mask, :].sum(axis=0)
-            onset_env = librosa.onset.onset_strength(S=librosa.power_to_db(band_energy[np.newaxis, :] ** 2), sr=sr)
-            onsets = librosa.onset.onset_detect(onset_envelope=onset_env, sr=sr, units='time')
+            band_power = (S[mask, :] ** 2).sum(axis=0)
+            band_db = librosa.power_to_db(band_power[np.newaxis, :], ref=np.max)
+            onset_env = librosa.onset.onset_strength(
+                S=band_db, sr=sr, hop_length=hop_length
+            )
+            onsets = librosa.onset.onset_detect(
+                onset_envelope=onset_env, sr=sr,
+                hop_length=hop_length, units='time'
+            )
             result[name] = round(len(onsets) / duration, 2)
         else:
             result[name] = 0.0

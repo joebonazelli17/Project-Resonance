@@ -49,8 +49,25 @@ async def search_similar(
     db.add(track)
     await db.commit()
 
-    results = await run_search(str(track_id), bars=bars, hop_bars=hop_bars, k=k)
-    return results
+    try:
+        results = await run_search(str(track_id), bars=bars, hop_bars=hop_bars, k=k)
+        return results
+    finally:
+        # Clean up temporary query track record and S3 object
+        try:
+            from app.core.database import async_session as _async_session
+            async with _async_session() as cleanup_db:
+                query_track = await cleanup_db.get(Track, track_id)
+                if query_track:
+                    await cleanup_db.delete(query_track)
+                    await cleanup_db.commit()
+        except Exception:
+            pass
+        try:
+            from app.core.storage import delete_file
+            delete_file(s3_key)
+        except Exception:
+            pass
 
 
 @router.get("/text", response_model=TextSearchResponse)
@@ -363,8 +380,18 @@ async def library_stats(db: AsyncSession = Depends(get_db)):
     result_sections = await db.execute(select(TrackSection))
     sections = result_sections.scalars().all()
 
+    bars_dist: dict[int, int] = {}
+    for sec in sections:
+        bars_dist[sec.bars] = bars_dist.get(sec.bars, 0) + 1
+
+    mastering_dist: dict[str, int] = {}
+    for t in tracks:
+        state = t.mastering_state or "unknown"
+        mastering_dist[state] = mastering_dist.get(state, 0) + 1
+
     return {
         "total_tracks": len(tracks),
         "total_sections": len(sections),
-        "bars_distribution": {},
+        "bars_distribution": dict(sorted(bars_dist.items())),
+        "mastering_distribution": mastering_dist,
     }
