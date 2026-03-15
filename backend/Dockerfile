@@ -10,11 +10,11 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 RUN pip install --no-cache-dir essentia
 
-# Download CLAP checkpoint at build time
-RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && \
+# Download CLAP checkpoint at build time (--insecure needed for corporate proxy)
+RUN apt-get update && apt-get install -y --no-install-recommends curl && \
     rm -rf /var/lib/apt/lists/* && \
     mkdir -p /models/clap && \
-    curl -L -o /models/clap/music_audioset_epoch_15_esc_90.14.pt \
+    curl -k -L -o /models/clap/music_audioset_epoch_15_esc_90.14.pt \
     "https://huggingface.co/lukewys/laion_clap/resolve/main/music_audioset_epoch_15_esc_90.14.pt"
 
 COPY . .

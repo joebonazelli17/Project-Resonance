@@ -10,7 +10,7 @@ The long-term vision includes an AI Mix Coach (loudness/spectral/dynamics feedba
 
 ### Backend (`backend/`)
 - **FastAPI** (async, Python 3.11+)
-- **PostgreSQL** via SQLAlchemy 2.0 async + asyncpg
+- **PostgreSQL** via SQLAlchemy 2.0 (async via asyncpg for API routes, sync via psycopg2 for background workers)
 - **MinIO** (S3-compatible) for audio file storage
 - **CLAP** (LAION, HTSAT-base) for audio + text embeddings (512-dim shared space)
 - **Essentia** for beat tracking, BPM, key, time signature detection
@@ -140,16 +140,22 @@ Project-Resonance/
 8. **Waveform Player** -- wavesurfer.js with colored region overlays, play/pause, section click-to-play
 9. **Track Detail Page** -- waveform + section cards with feature bars, spectral mini-charts, label badges, stereo width, bar/label filtering
 
+## Docker & Infrastructure Notes
+
+- **Port conflict**: MinIO API is mapped to host port **9002** (not 9000) because 9000 was already in use. MinIO console is on **9001**. Internally in Docker, MinIO still listens on 9000 and the backend connects to `minio:9000` via Docker networking.
+- **SSL/corporate proxy**: The backend Dockerfile uses `curl -k` (skip SSL verification) to download the CLAP checkpoint from HuggingFace. This is needed because the EY corporate proxy intercepts SSL with its own certificate. This only affects the build-time model download.
+- **Background worker architecture**: The analysis worker (`workers/analyze.py`) uses **synchronous** SQLAlchemy sessions (psycopg2) instead of async (asyncpg). This is because FastAPI's `BackgroundTasks` runs in a threadpool, and creating a new async event loop inside that thread conflicts with uvicorn's event loop. The API routes still use async sessions normally.
+- **Volume mounts**: The backend container mounts `./backend:/app` with `--reload`, so Python code changes are picked up live without rebuilding. Only changes to `requirements.txt` or `Dockerfile` require `docker compose up --build`.
+- **First build time**: ~20-30 min (PyTorch ~915MB + CLAP checkpoint ~600MB). Subsequent rebuilds reuse cached layers unless requirements.txt changes.
+
 ## What Still Needs Doing
 
-- **Docker setup**: Docker Desktop needs to be installed on the dev machine. Then `docker compose up --build` from root
-- **CLAP model checkpoint**: needs to be mounted into the Docker container at the path in config (or set CLAP_CKPT env var)
-- **Essentia**: needs to be installed in the Docker image (the Dockerfile may need `essentia` added -- it uses apt or pip depending on platform)
-- **Git commit/push**: Droid-Shield blocked automated commits due to default dev credentials in .env.example and docker-compose.yml. User must commit manually
-- **Alembic migrations**: not yet set up -- currently using `create_all` on startup
-- **Authentication**: none yet -- open API
-- **MuQ-MuLan**: architecture is ready for drop-in swap but not implemented
-- **Energy curve visualization**: data is stored and served via API but no frontend chart component yet
+- **Validation testing**: Upload real tracks and verify analysis quality (BPM accuracy, section labels, search relevance). This is the highest priority -- no features have been tested with real audio yet
+- **Alembic migrations**: not set up -- currently using `create_all` on startup, which means schema changes require dropping the DB
+- **Authentication**: none -- open API
+- **MuQ-MuLan**: architecture ready for drop-in swap but not implemented
+- **Energy curve visualization**: data stored and API-served but no frontend chart component yet
+- **Essentia platform compatibility**: installed via pip in Docker -- may need troubleshooting on some platforms
 
 ## How to Run
 
@@ -157,7 +163,8 @@ Project-Resonance/
 # Prerequisites: Docker Desktop installed and running
 
 # From project root:
-docker compose up --build
+docker compose up --build    # first time or after requirements/Dockerfile changes
+docker compose up            # subsequent runs (uses cached images)
 
 # Frontend: http://localhost:3000
 # Backend API: http://localhost:8000/api/health
@@ -166,11 +173,21 @@ docker compose up --build
 
 # For frontend dev only (no backend):
 cd frontend && npm install && npm run dev
+
+# If port 9000 is in use, MinIO API is on 9002:
+# http://localhost:9002 (S3 API -- not usually accessed directly)
 ```
+
+## Bugs Fixed
+
+1. **Event loop conflict in analysis worker** -- `asyncpg` sessions created inside `asyncio.new_event_loop()` in a background thread clashed with uvicorn's uvloop. Fixed by switching the worker to synchronous `psycopg2` sessions.
+2. **CLAP download SSL failure in Docker** -- EY corporate proxy intercepts HTTPS with its own cert, causing Python's `urllib` and curl to fail SSL verification. Fixed with `curl -k` in Dockerfile.
+3. **Docker Desktop corruption** -- 12-hour hung build corrupted Docker's internal state (500 errors from API). Required full uninstall/reinstall of Docker Desktop + data directory cleanup.
+4. **Port 9000 conflict** -- MinIO's default port was already in use. Remapped host port to 9002.
 
 ## Git Info
 
 - Repo: https://github.com/joebonazelli17/Project-Resonance
 - Branch: main
-- Last pushed commit: Platform scaffold (FastAPI + Next.js + Docker)
-- Unpushed work: All enhancements (text search, stems, spectral, energy curves, labels, stereo, DAE, waveform player, track detail page)
+- Latest commit: `2666794` - Getting docker working
+- Unpushed work: sync DB worker fix, psycopg2-binary dependency, port remapping, Project_Status.md update
