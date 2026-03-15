@@ -8,7 +8,7 @@ WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-RUN pip install --no-cache-dir essentia
+RUN pip install --no-cache-dir essentia==2.1b6.dev1389
 
 # Download model files at build time
 # CLAP checkpoint (~600MB), BERT tokenizer vocab, RoBERTa model (~500MB), Demucs (~80MB)

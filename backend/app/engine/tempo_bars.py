@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import List, Tuple, Optional, Sequence
 import numpy as np
 
-# --- Essentia only: hard fail if not present (gold standard) ---
+# --- Essentia only: gold standard pipeline ---
 try:
     import essentia
     import essentia.standard as es
@@ -244,7 +244,6 @@ def detect_beats_bpm_key(
 
     beats, bpm0 = _beats_essentia(y)
     if beats.size < 2:
-        # Not enough beat info — fail loudly for "best only" policy
         raise RuntimeError("Beat tracking failed to produce enough ticks for robust slicing.")
 
     bpm = _tempo_octave_correction(beats, bpm0)

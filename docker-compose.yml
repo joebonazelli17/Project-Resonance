@@ -28,7 +28,11 @@ services:
       - "9001:9001"
 
   backend:
-    build: ./backend
+    platform: linux/amd64
+    build:
+      context: ./backend
+      platforms:
+        - linux/amd64
     depends_on:
       db:
         condition: service_healthy
