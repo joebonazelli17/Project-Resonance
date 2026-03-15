@@ -17,6 +17,7 @@ class TrackOut(BaseModel):
     beats_per_bar: int | None = None
     status: str
     error_message: str | None = None
+    mastering_state: str | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -44,8 +45,11 @@ class TrackSectionOut(BaseModel):
     crest_db: float
     flatness: float
     section_label: str | None = None
+    section_label_confidence: float | None = None
     band_energies: dict | None = None
     stereo_features: dict | None = None
+    band_crest: dict | None = None
+    band_transient_density: dict | None = None
 
     model_config = {"from_attributes": True}
 

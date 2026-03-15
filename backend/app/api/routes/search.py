@@ -207,34 +207,148 @@ async def compare_sections(
     section_b_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
 ):
-    """Compare spectral + stereo profiles of two sections. Returns per-band dB deltas and stereo diff."""
-    from app.engine.spectral import BAND_NAMES
+    """
+    Smart comparison with actionable, mastering-aware recommendations.
+    Section A = user's track, Section B = reference.
+    """
+    from app.engine.spectral import BAND_NAMES, BAND_EDGES_HZ
 
-    result_a = await db.execute(select(TrackSection).where(TrackSection.id == section_a_id))
-    result_b = await db.execute(select(TrackSection).where(TrackSection.id == section_b_id))
+    result_a = await db.execute(
+        select(TrackSection).where(TrackSection.id == section_a_id)
+    )
+    result_b = await db.execute(
+        select(TrackSection).where(TrackSection.id == section_b_id)
+    )
     sec_a = result_a.scalar_one_or_none()
     sec_b = result_b.scalar_one_or_none()
     if not sec_a or not sec_b:
         raise HTTPException(404, "Section not found")
 
+    # Get parent tracks for mastering state
+    track_a_result = await db.execute(select(Track).where(Track.id == sec_a.track_id))
+    track_b_result = await db.execute(select(Track).where(Track.id == sec_b.track_id))
+    track_a = track_a_result.scalar_one_or_none()
+    track_b = track_b_result.scalar_one_or_none()
+
+    mastering_a = track_a.mastering_state if track_a else "unknown"
+    mastering_b = track_b.mastering_state if track_b else "unknown"
+    mastering_mismatch = (mastering_a != mastering_b) and "mastered" in (mastering_a or "", mastering_b or "")
+
     bands_a = sec_a.band_energies or {}
     bands_b = sec_b.band_energies or {}
-    spectral_delta = {name: round(bands_a.get(name, -96) - bands_b.get(name, -96), 2) for name in BAND_NAMES}
-
+    crest_a = sec_a.band_crest or {}
+    crest_b = sec_b.band_crest or {}
+    td_a = sec_a.band_transient_density or {}
+    td_b = sec_b.band_transient_density or {}
     stereo_a = sec_a.stereo_features or {}
     stereo_b = sec_b.stereo_features or {}
+
+    # Relative spectral shape (anchor at 1kHz = mid band)
+    mid_a = bands_a.get("mid", -30)
+    mid_b = bands_b.get("mid", -30)
+    spectral_shape_delta = {}
+    for name in BAND_NAMES:
+        rel_a = bands_a.get(name, -96) - mid_a
+        rel_b = bands_b.get(name, -96) - mid_b
+        spectral_shape_delta[name] = round(rel_a - rel_b, 2)
+
+    # Generate actionable recommendations
+    recommendations = []
+
+    for i, name in enumerate(BAND_NAMES):
+        delta = spectral_shape_delta[name]
+        lo, hi = BAND_EDGES_HZ[i], BAND_EDGES_HZ[i + 1]
+        td_delta = td_a.get(name, 0) - td_b.get(name, 0)
+
+        if abs(delta) < 1.5:
+            continue
+
+        if abs(td_delta) > 1.0 and abs(delta) > 2.0:
+            # Transient density difference -- arrangement issue, not EQ
+            if td_delta < 0:
+                recommendations.append({
+                    "band": name,
+                    "freq_range": f"{lo}-{hi}Hz",
+                    "type": "arrangement",
+                    "message": f"Reference has {abs(td_delta):.1f} more transient events/sec at {lo}-{hi}Hz. "
+                               f"This suggests more rhythmic content (e.g., faster hat patterns), not an EQ issue. "
+                               f"Adding EQ boost here would make existing elements too bright.",
+                    "severity": "info",
+                })
+            else:
+                recommendations.append({
+                    "band": name,
+                    "freq_range": f"{lo}-{hi}Hz",
+                    "type": "arrangement",
+                    "message": f"Your track has {abs(td_delta):.1f} more transient events/sec at {lo}-{hi}Hz than the reference.",
+                    "severity": "info",
+                })
+        elif delta < -1.5:
+            recommendations.append({
+                "band": name,
+                "freq_range": f"{lo}-{hi}Hz",
+                "type": "eq",
+                "message": f"Consider a ~{abs(delta):.1f}dB boost around {lo}-{hi}Hz to match the reference's tonal balance.",
+                "severity": "suggestion",
+            })
+        elif delta > 1.5:
+            recommendations.append({
+                "band": name,
+                "freq_range": f"{lo}-{hi}Hz",
+                "type": "eq",
+                "message": f"Your track is ~{abs(delta):.1f}dB hotter at {lo}-{hi}Hz. Consider a gentle cut.",
+                "severity": "suggestion",
+            })
+
+    # Dynamics recommendations (mastering-aware)
+    dynamics_delta = {
+        "rms_dbfs": round(sec_a.rms_dbfs - sec_b.rms_dbfs, 2),
+        "peak_dbfs": round(sec_a.peak_dbfs - sec_b.peak_dbfs, 2),
+        "crest_db": round(sec_a.crest_db - sec_b.crest_db, 2),
+    }
+
+    if mastering_mismatch:
+        recommendations.append({
+            "type": "mastering_context",
+            "message": f"Note: your track appears to be '{mastering_a}' while the reference is '{mastering_b}'. "
+                       f"Differences in overall loudness, crest factor, and compression are expected and should "
+                       f"not be corrected at the mix stage. Focus on relative spectral balance and stereo image.",
+            "severity": "warning",
+        })
+    else:
+        if dynamics_delta["crest_db"] > 4:
+            recommendations.append({
+                "type": "dynamics",
+                "message": f"Your crest factor is {dynamics_delta['crest_db']:.1f}dB higher -- consider bus compression to increase density.",
+                "severity": "suggestion",
+            })
+
+    # Stereo recommendations
+    if stereo_a and stereo_b:
+        ms_diff = stereo_a.get("mid_side_ratio", 1) - stereo_b.get("mid_side_ratio", 1)
+        if abs(ms_diff) > 0.1:
+            direction = "narrower" if ms_diff > 0 else "wider"
+            recommendations.append({
+                "type": "stereo",
+                "message": f"Your stereo image is {direction} than the reference (mid/side ratio diff: {ms_diff:.2f}).",
+                "severity": "suggestion",
+            })
 
     return {
         "section_a": str(section_a_id),
         "section_b": str(section_b_id),
-        "spectral_delta_db": spectral_delta,
+        "mastering_state_a": mastering_a,
+        "mastering_state_b": mastering_b,
+        "mastering_mismatch": mastering_mismatch,
+        "spectral_shape_delta": spectral_shape_delta,
+        "band_crest_a": crest_a,
+        "band_crest_b": crest_b,
+        "transient_density_a": td_a,
+        "transient_density_b": td_b,
         "stereo_a": stereo_a,
         "stereo_b": stereo_b,
-        "dynamics_delta": {
-            "rms_dbfs": round(sec_a.rms_dbfs - sec_b.rms_dbfs, 2),
-            "peak_dbfs": round(sec_a.peak_dbfs - sec_b.peak_dbfs, 2),
-            "crest_db": round(sec_a.crest_db - sec_b.crest_db, 2),
-        },
+        "dynamics_delta": dynamics_delta,
+        "recommendations": recommendations,
     }
 
 

@@ -47,6 +47,7 @@ class Track(Base):
     )
 
     energy_curve: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    mastering_state: Mapped[str | None] = mapped_column(String(16), nullable=True)
 
     sections: Mapped[list[TrackSection]] = relationship(back_populates="track", cascade="all, delete-orphan")
 
@@ -74,8 +75,15 @@ class TrackSection(Base):
     flatness: Mapped[float] = mapped_column(Float, default=0.0)
 
     section_label: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    section_label_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
     band_energies: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     stereo_features: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    band_crest: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    band_transient_density: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+    eq_profile: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    eq_profile_peak: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    eq_profile_variance: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
 
     embedding: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     embedding_drums: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)

@@ -1,10 +1,47 @@
 # Project Resonance -- Status & Architecture
 
-## What Is This
+## The Vision
 
-An AI Music Intelligence Platform built for music producers and DJs. The core product is a **Reference Track Engine** that lets producers search their music library by audio similarity, text description, or stem-weighted queries -- at the section level (bars), not just whole tracks.
+An AI Music Intelligence Platform for music producers. Two core products:
 
-The long-term vision includes an AI Mix Coach (loudness/spectral/dynamics feedback vs genre norms), but the current build focuses entirely on the Reference Engine.
+1. **Reference Track Engine** (current focus) -- A producer uploads their track. The system breaks it into sections (2, 4, 8, 16 bars -- eventually user-configurable) and for each section, finds the most similar sections from a library of professional reference tracks. Different reference tracks can match different sections. The goal: a huge library of professional reference tracks where the system intelligently matches section-by-section, giving producers a precise map of "your verse sounds most like this reference's verse, your drop matches this other reference's drop."
+
+2. **AI Mix Coach** (future) -- Loudness/spectral/dynamics feedback vs genre norms. Tells producers what to adjust and why.
+
+The long-term goal is that advanced professional producers say "I can't work without this." It needs to be gold-standard, novel, and deeply useful -- not just a tech demo.
+
+## Product Philosophy
+
+### What makes this different from existing tools
+
+Existing tools (Mastering The Mix REFERENCE, iZotope Audiolens) do static A/B comparison between your track and a single reference. They show average spectral curves and say "boost here." But:
+
+- **Average spectral curves are misleading.** If the reference has 1/16th hats and you have 1/8th hats, the reference will show more high-end energy. But boosting your existing hats to match the average makes them too bright -- the real difference is *arrangement density* (more rhythmic events), not EQ balance. Our tool needs to distinguish between tonal differences (EQ-fixable) and arrangement differences (not EQ-fixable).
+
+- **Mastering state skews everything.** A mastered reference has been squashed through a limiter. Comparing a pre-master mix to that will always show "undercompressed." REFERENCE plugin's compression feedback led the creator of this project to over-compress early mixes -- the tool was comparing mastering-stage characteristics to a mix-stage track. Our tool must detect mastering state and contextualize all feedback accordingly.
+
+- **Section-level matching is novel.** No existing tool finds reference matches per-section across a library. They require you to manually choose a reference. We automate discovery.
+
+### Key insights to preserve
+
+1. **Peak vs average vs variance per frequency band**: Two tracks can have identical average spectral curves but completely different transient content and arrangement density. We need to analyze all three dimensions to give accurate feedback.
+
+2. **Per-band transient density**: The 1/16th vs 1/8th hat problem. Counting onset events per second per frequency band reveals whether a spectral difference is due to more events or louder events.
+
+3. **Per-band crest factor**: Reveals compression state per frequency range. A mastered track has low crest across all bands. A mix might have high crest in the sub (uncompressed bass) but low crest in mids (compressed vocals).
+
+4. **Mastering-aware recommendations**: If reference is mastered and user track isn't, exclude dynamics/loudness advice. Focus on spectral shape (relative balance), stereo decisions, and arrangement density.
+
+5. **Spectral shape comparison should be relative**: Compare curves relative to a 1kHz anchor point, not in absolute dB. Absolute dB is meaningless when one track has been through a limiter.
+
+6. **The original CLI pipeline had features we dropped**: The 64-band mel EQ profile and blended search scoring (CLAP + EQ + HF gating) were more sophisticated than what we replaced them with. The 8-band display profile is fine for UI but too coarse for search. We need both.
+
+### Future enhancements (captured for continuity)
+
+- **User-configurable chunk size**: Let users choose bar size for section matching
+- **Match confirmation flow**: Queue up each section pair (user + reference), let user confirm/reject similarity
+- **Self-learning feedback loop**: When users agree/disagree with match quality, use that signal to tune scoring weights and thresholds over time. This is a major differentiator -- the system gets better with use.
+- **MuQ-MuLan model swap**: Architecture ready for drop-in replacement of CLAP with newer embedding models
 
 ## Tech Stack
 
@@ -27,45 +64,6 @@ The long-term vision includes an AI Mix Coach (loudness/spectral/dynamics feedba
 ### Infrastructure
 - **docker-compose.yml** orchestrates 4 services: Postgres 16, MinIO, FastAPI backend, Next.js frontend
 - **Dockerfiles** for both backend and frontend (standalone Next.js output)
-- `.env.example` with all config variables
-
-## Architecture
-
-```
-Project-Resonance/
-├── backend/
-│   ├── app/
-│   │   ├── api/routes/         # health.py, tracks.py, search.py
-│   │   ├── core/               # config.py, database.py, storage.py
-│   │   ├── engine/             # Audio analysis engine
-│   │   │   ├── embeddings.py   # CLAP audio/text embedding + DAE hybrid
-│   │   │   ├── index.py        # FAISS index builder
-│   │   │   ├── pipeline.py     # Original CLI pipeline (migrated)
-│   │   │   ├── spectral.py     # Multi-band analysis, energy curves, stereo, section labels
-│   │   │   ├── stems.py        # Demucs stem separation
-│   │   │   └── tempo_bars.py   # Essentia beat/BPM/key/time-sig detection
-│   │   ├── models/track.py     # SQLAlchemy models (Track, TrackSection)
-│   │   ├── schemas/track.py    # Pydantic response schemas
-│   │   ├── workers/analyze.py  # Background analysis + search logic
-│   │   └── main.py             # FastAPI app entry point
-│   ├── Dockerfile
-│   └── requirements.txt
-├── frontend/
-│   ├── src/
-│   │   ├── app/                # Next.js App Router pages
-│   │   │   ├── page.tsx        # Library (upload + track list)
-│   │   │   ├── search/page.tsx # Search (text / stems / audio tabs)
-│   │   │   └── tracks/[id]/    # Track detail (waveform + sections)
-│   │   ├── components/
-│   │   │   └── WaveformPlayer.tsx  # wavesurfer.js component
-│   │   └── lib/api.ts          # API client + TypeScript types
-│   ├── Dockerfile
-│   └── package.json
-├── docker-compose.yml
-├── .env.example
-├── app/                        # Original CLI engine code (pre-platform)
-└── data/                       # Local corpus + cache (gitignored)
-```
 
 ## Database Models
 
@@ -74,6 +72,7 @@ Project-Resonance/
 - duration_s, bpm, key, scale, beats_per_bar
 - status (pending/analyzing/ready/failed), error_message
 - energy_curve (JSON: times, lufs, centroid, onset_density, low_ratio)
+- mastering_state (string: "mastered", "pre_master", "unknown")
 - created_at, updated_at
 
 ### TrackSection
@@ -81,121 +80,71 @@ Project-Resonance/
 - start_s, end_s, bars, bar_start, bar_end
 - bpm, key, scale
 - hf_perc_ratio, rms_dbfs, peak_dbfs, crest_db, flatness
-- section_label (intro/verse/buildup/drop/breakdown/outro)
-- band_energies (JSON: 8-band dB profile -- sub through air)
+- section_label, section_label_confidence
+- band_energies (JSON: 8-band dB profile -- for UI display)
 - stereo_features (JSON: correlation, mid_side_ratio, width_by_band)
+- band_crest (JSON: 8-band peak-to-RMS ratio -- compression state per band)
+- band_transient_density (JSON: 8-band onset events per second)
 - embedding (LargeBinary: 512 float32, full mix CLAP)
-- embedding_drums, embedding_bass, embedding_vocals, embedding_other (per-stem CLAP)
+- embedding_drums/bass/vocals/other (per-stem CLAP)
+- eq_profile (LargeBinary: 64 float32, average mel profile -- for search ranking)
+- eq_profile_peak (LargeBinary: 64 float32, peak mel profile)
+- eq_profile_variance (LargeBinary: 64 float32, spectral movement)
 
-## API Endpoints
+## Analysis Pipeline
 
-### Tracks
-- `POST /api/tracks/upload` -- upload audio file, triggers background analysis
-- `GET /api/tracks` -- list all tracks (filterable by status)
-- `GET /api/tracks/{id}` -- track detail with all sections
-- `GET /api/tracks/{id}/energy` -- track with energy curve data
-- `GET /api/tracks/{id}/stream` -- presigned S3 URL for playback
-- `DELETE /api/tracks/{id}` -- delete track + S3 object
+1. File stored in S3 (MinIO), track record created (status=pending)
+2. Background worker:
+   a. Download from S3, load mono float32 at 44.1kHz
+   b. Essentia beat tracking -> BPM, key, scale, time signature, downbeat phase
+   c. Track-level energy curve (LUFS/centroid/onset/low-ratio over time)
+   d. Mastering state detection (crest factor, peak-to-LUFS, loudness histogram)
+   e. Demucs stem separation -> drums, bass, vocals, other
+   f. Stereo load for stereo analysis (if stereo source)
+   g. For each bar size (2, 4, 8, 16), beat-aligned window slicing:
+      - Core features: hf_perc_ratio, rms_dbfs, peak_dbfs, crest_db, flatness
+      - 64-band mel profiles: average, peak, variance
+      - 8-band spectral energy (for UI), crest, transient density
+      - Stereo features, section label (relative thresholds) + confidence
+      - Stem window slicing
+   h. Batch CLAP embedding of all mix + stem segments
+   i. Store everything to Postgres, status -> ready
 
-### Search
-- `POST /api/search` -- audio similarity search (upload query file)
-- `GET /api/search/text?q=...&bars=...&k=...` -- text-to-audio search via CLAP
-- `POST /api/search/stems` -- stem-weighted text search (JSON body with weights)
-- `GET /api/search/compare/{a}/{b}` -- spectral + stereo + dynamics comparison of two sections
-- `GET /api/search/library/stats` -- library overview stats
+## Search Scoring
 
-## Analysis Pipeline (what happens on upload)
-
-1. File stored in S3 (MinIO)
-2. Track record created in Postgres (status=pending)
-3. Background worker:
-   a. Downloads file from S3 to temp dir
-   b. Loads mono float32 at 44.1kHz
-   c. Essentia beat tracking -> BPM, key, scale, time signature, downbeat phase
-   d. Computes track-level energy curve (LUFS/centroid/onset/low-ratio over time)
-   e. Attempts Demucs stem separation -> drums, bass, vocals, other
-   f. Loads stereo version for stereo analysis (if stereo source)
-   g. For each bar size (2, 4, 8, 16):
-      - Beat-aligned window slicing (with fallback to BPM-based)
-      - For each window:
-        - Extra features: hf_perc_ratio, rms_dbfs, peak_dbfs, crest_db, flatness
-        - 8-band spectral energy profile
-        - Stereo features (if stereo source)
-        - Section label heuristic (intro/verse/buildup/drop/breakdown/outro)
-        - Slices corresponding stem windows
-   h. Batch CLAP embedding of all mix segments (N, 512)
-   i. Batch CLAP embedding of each stem's segments
-   j. Stores everything to Postgres
-   k. Status -> ready
-
-## Key Features Built
-
-1. **Text-to-Audio Search** -- type "dark minimal techno kick" and search via CLAP's shared text-audio embedding space
-2. **Stem-Level Similarity** -- Demucs separates tracks into drums/bass/vocals/other, each embedded separately. Search with per-stem weight sliders
-3. **Multi-Band Spectral Profiles** -- 8-band energy (sub/low/low-mid/mid/high-mid/presence/brilliance/air) per section with visual bar charts
-4. **Arrangement Energy Curves** -- track-level LUFS, spectral centroid, onset density, low-energy ratio over time
-5. **Semantic Section Labels** -- heuristic classification as intro/verse/buildup/drop/breakdown/outro. Filterable in UI
-6. **Stereo Width Analysis** -- L-R correlation, mid/side ratio, per-band stereo width
-7. **DAE Hybrid Embeddings** -- function to concatenate CLAP + engineered features for composite similarity (ready but not yet wired to search)
-8. **Waveform Player** -- wavesurfer.js with colored region overlays, play/pause, section click-to-play
-9. **Track Detail Page** -- waveform + section cards with feature bars, spectral mini-charts, label badges, stereo width, bar/label filtering
+Blended multi-signal scoring:
+- `score = w_clap * clap_sim + w_eq * eq_profile_cosine_sim + w_feat * feature_sim`
+- HF percussive ratio hard gate (skip spectrally incompatible matches)
+- Loudness normalization before comparison
+- DAE hybrid embeddings as optional mode (CLAP + engineered features)
+- All weights configurable per search request
 
 ## Docker & Infrastructure Notes
 
-- **Port conflict**: MinIO API is mapped to host port **9002** (not 9000) because 9000 was already in use on the work machine. MinIO console is on **9001**. Internally in Docker, MinIO still listens on 9000 and the backend connects to `minio:9000` via Docker networking.
-- **Model downloads at build time**: The Dockerfile downloads all required AI models during `docker compose up --build`:
-  - CLAP checkpoint (~600MB) from huggingface.co
-  - RoBERTa base model (~500MB) from huggingface.co -- used by CLAP's text encoder
-  - BERT tokenizer vocab (~230KB) from github.com
-  - Demucs htdemucs model (~80MB) from dl.fbaipublicfiles.com
-  - BERT tokenizer config files are bundled in `backend/models/bert-base-uncased/` (tracked in git)
-- **HuggingFace model redirect**: `main.py` monkey-patches `BertTokenizer.from_pretrained` and `PreTrainedModel.from_pretrained` to load from `/models/` instead of downloading from huggingface.co at runtime. This is necessary because CLAP hardcodes model names at import time.
-- **Background worker architecture**: The analysis worker (`workers/analyze.py`) uses **synchronous** SQLAlchemy sessions (psycopg2) instead of async (asyncpg). This is because FastAPI's `BackgroundTasks` runs in a threadpool, and creating a new async event loop inside that thread conflicts with uvicorn's event loop. The API routes still use async sessions normally.
-- **Volume mounts**: The backend container mounts `./backend:/app` with `--reload`, so Python code changes are picked up live without rebuilding. Only changes to `requirements.txt` or `Dockerfile` require `docker compose up --build`.
-- **First build time**: ~20-30 min (PyTorch ~915MB + model downloads ~1.2GB). Subsequent rebuilds reuse cached layers unless requirements.txt changes.
-- **Corporate proxy (Zscaler)**: EY's Zscaler proxy blocks all HTTPS to huggingface.co. The Dockerfile must be built on a network without Zscaler (e.g. home network). Once built, all models are cached in the Docker image and no internet access is needed.
+- MinIO API on host port **9002** (9000 was in use). Console on **9001**.
+- Dockerfile downloads CLAP (~600MB), RoBERTa (~500MB), BERT vocab, Demucs (~80MB) at build time.
+- `main.py` monkey-patches HuggingFace `from_pretrained` to load from `/models/`.
+- Background worker uses sync psycopg2 (not async asyncpg) to avoid event loop conflicts.
+- `./backend:/app` volume mount with `--reload` -- code changes picked up live.
+- **Zscaler**: EY corporate proxy blocks huggingface.co. First build must be on unrestricted network.
 
-## What Still Needs Doing
+## Current Status
 
-- **First successful build on unrestricted network**: Build must happen on home/personal network (no Zscaler). Then everything is cached in the Docker image.
-- **Validation testing**: Upload real tracks and verify analysis quality (BPM accuracy, section labels, search relevance). This is the highest priority -- no features have been tested with real audio yet.
-- **Alembic migrations**: not set up -- currently using `create_all` on startup, which means schema changes require dropping the DB
-- **Authentication**: none -- open API
-- **MuQ-MuLan**: architecture ready for drop-in swap but not implemented
-- **Energy curve visualization**: data stored and API-served but no frontend chart component yet
+### Working
+- Full-stack scaffolding, upload/list/delete tracks
+- Essentia beat/BPM/key, Demucs stems, CLAP embeddings
+- 8-band spectral profiles, stereo width, energy curves
+- Waveform player, track detail page, text/stem search
 
-## How to Run
-
-```bash
-# Prerequisites: Docker Desktop installed and running
-# IMPORTANT: First build must be on a network without Zscaler/corporate proxy
-
-# From project root:
-docker compose up --build    # first time or after requirements/Dockerfile changes
-docker compose up            # subsequent runs (uses cached images)
-
-# Frontend: http://localhost:3000
-# Backend API: http://localhost:8000/api/health
-# MinIO console: http://localhost:9001 (minioadmin/minioadmin)
-# Postgres: localhost:5432 (resonance/resonance)
-
-# For frontend dev only (no backend):
-cd frontend && npm install && npm run dev
-
-# If port 9000 is in use, MinIO API is on 9002:
-# http://localhost:9002 (S3 API -- not usually accessed directly)
-```
-
-## Bugs Fixed
-
-1. **Event loop conflict in analysis worker** -- `asyncpg` sessions created inside `asyncio.new_event_loop()` in a background thread clashed with uvicorn's uvloop. Fixed by switching the worker to synchronous `psycopg2` sessions.
-2. **CLAP missing torchvision** -- CLAP imports torchvision at module level. Added to requirements.txt.
-3. **CLAP/RoBERTa runtime model downloads** -- CLAP hardcodes `from_pretrained("bert-base-uncased")` and `from_pretrained("roberta-base")` at import time, trying to download from huggingface.co. Fixed by monkey-patching in `main.py` to redirect to pre-downloaded local files in `/models/`.
-4. **Docker Desktop corruption** -- 12-hour hung build corrupted Docker's internal state (500 errors from API). Required full uninstall/reinstall of Docker Desktop + data directory cleanup.
-5. **Port 9000 conflict** -- MinIO's default port was already in use. Remapped host port to 9002.
+### In progress (current sprint)
+- Phase 1: Deep spectral analysis (64-band profiles, per-band crest, transient density)
+- Phase 2: Mastering state detection
+- Phase 3: Blended search scoring
+- Phase 4: Relative section labels with confidence
+- Phase 5: Smart comparison recommendations
+- Phase 6: Energy curve frontend visualization
 
 ## Git Info
 
 - Repo: https://github.com/joebonazelli17/Project-Resonance
 - Branch: main
-- Next step: Build Docker on home network (no Zscaler), then validate with real audio tracks
