@@ -26,6 +26,7 @@ faiss-cpu==1.8.0
 tqdm==4.66.4
 certifi>=2024.2.2
 laion-clap==1.1.7
+torchvision
 
 # Stem separation
 demucs==4.0.1

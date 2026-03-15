@@ -33,6 +33,13 @@ Thumbs.db
 pgdata/
 miniodata/
 
+# Model binaries (downloaded at Docker build time)
+*.pt
+*.th
+*.bin
+backend/models/bert-base-uncased/vocab.txt
+backend/models/roberta-base/
+
 # IDE
 .vscode/
 .idea/

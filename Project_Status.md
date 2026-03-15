@@ -142,25 +142,33 @@ Project-Resonance/
 
 ## Docker & Infrastructure Notes
 
-- **Port conflict**: MinIO API is mapped to host port **9002** (not 9000) because 9000 was already in use. MinIO console is on **9001**. Internally in Docker, MinIO still listens on 9000 and the backend connects to `minio:9000` via Docker networking.
-- **SSL/corporate proxy**: The backend Dockerfile uses `curl -k` (skip SSL verification) to download the CLAP checkpoint from HuggingFace. This is needed because the EY corporate proxy intercepts SSL with its own certificate. This only affects the build-time model download.
+- **Port conflict**: MinIO API is mapped to host port **9002** (not 9000) because 9000 was already in use on the work machine. MinIO console is on **9001**. Internally in Docker, MinIO still listens on 9000 and the backend connects to `minio:9000` via Docker networking.
+- **Model downloads at build time**: The Dockerfile downloads all required AI models during `docker compose up --build`:
+  - CLAP checkpoint (~600MB) from huggingface.co
+  - RoBERTa base model (~500MB) from huggingface.co -- used by CLAP's text encoder
+  - BERT tokenizer vocab (~230KB) from github.com
+  - Demucs htdemucs model (~80MB) from dl.fbaipublicfiles.com
+  - BERT tokenizer config files are bundled in `backend/models/bert-base-uncased/` (tracked in git)
+- **HuggingFace model redirect**: `main.py` monkey-patches `BertTokenizer.from_pretrained` and `PreTrainedModel.from_pretrained` to load from `/models/` instead of downloading from huggingface.co at runtime. This is necessary because CLAP hardcodes model names at import time.
 - **Background worker architecture**: The analysis worker (`workers/analyze.py`) uses **synchronous** SQLAlchemy sessions (psycopg2) instead of async (asyncpg). This is because FastAPI's `BackgroundTasks` runs in a threadpool, and creating a new async event loop inside that thread conflicts with uvicorn's event loop. The API routes still use async sessions normally.
 - **Volume mounts**: The backend container mounts `./backend:/app` with `--reload`, so Python code changes are picked up live without rebuilding. Only changes to `requirements.txt` or `Dockerfile` require `docker compose up --build`.
-- **First build time**: ~20-30 min (PyTorch ~915MB + CLAP checkpoint ~600MB). Subsequent rebuilds reuse cached layers unless requirements.txt changes.
+- **First build time**: ~20-30 min (PyTorch ~915MB + model downloads ~1.2GB). Subsequent rebuilds reuse cached layers unless requirements.txt changes.
+- **Corporate proxy (Zscaler)**: EY's Zscaler proxy blocks all HTTPS to huggingface.co. The Dockerfile must be built on a network without Zscaler (e.g. home network). Once built, all models are cached in the Docker image and no internet access is needed.
 
 ## What Still Needs Doing
 
-- **Validation testing**: Upload real tracks and verify analysis quality (BPM accuracy, section labels, search relevance). This is the highest priority -- no features have been tested with real audio yet
+- **First successful build on unrestricted network**: Build must happen on home/personal network (no Zscaler). Then everything is cached in the Docker image.
+- **Validation testing**: Upload real tracks and verify analysis quality (BPM accuracy, section labels, search relevance). This is the highest priority -- no features have been tested with real audio yet.
 - **Alembic migrations**: not set up -- currently using `create_all` on startup, which means schema changes require dropping the DB
 - **Authentication**: none -- open API
 - **MuQ-MuLan**: architecture ready for drop-in swap but not implemented
 - **Energy curve visualization**: data stored and API-served but no frontend chart component yet
-- **Essentia platform compatibility**: installed via pip in Docker -- may need troubleshooting on some platforms
 
 ## How to Run
 
 ```bash
 # Prerequisites: Docker Desktop installed and running
+# IMPORTANT: First build must be on a network without Zscaler/corporate proxy
 
 # From project root:
 docker compose up --build    # first time or after requirements/Dockerfile changes
@@ -181,13 +189,13 @@ cd frontend && npm install && npm run dev
 ## Bugs Fixed
 
 1. **Event loop conflict in analysis worker** -- `asyncpg` sessions created inside `asyncio.new_event_loop()` in a background thread clashed with uvicorn's uvloop. Fixed by switching the worker to synchronous `psycopg2` sessions.
-2. **CLAP download SSL failure in Docker** -- EY corporate proxy intercepts HTTPS with its own cert, causing Python's `urllib` and curl to fail SSL verification. Fixed with `curl -k` in Dockerfile.
-3. **Docker Desktop corruption** -- 12-hour hung build corrupted Docker's internal state (500 errors from API). Required full uninstall/reinstall of Docker Desktop + data directory cleanup.
-4. **Port 9000 conflict** -- MinIO's default port was already in use. Remapped host port to 9002.
+2. **CLAP missing torchvision** -- CLAP imports torchvision at module level. Added to requirements.txt.
+3. **CLAP/RoBERTa runtime model downloads** -- CLAP hardcodes `from_pretrained("bert-base-uncased")` and `from_pretrained("roberta-base")` at import time, trying to download from huggingface.co. Fixed by monkey-patching in `main.py` to redirect to pre-downloaded local files in `/models/`.
+4. **Docker Desktop corruption** -- 12-hour hung build corrupted Docker's internal state (500 errors from API). Required full uninstall/reinstall of Docker Desktop + data directory cleanup.
+5. **Port 9000 conflict** -- MinIO's default port was already in use. Remapped host port to 9002.
 
 ## Git Info
 
 - Repo: https://github.com/joebonazelli17/Project-Resonance
 - Branch: main
-- Latest commit: `2666794` - Getting docker working
-- Unpushed work: sync DB worker fix, psycopg2-binary dependency, port remapping, Project_Status.md update
+- Next step: Build Docker on home network (no Zscaler), then validate with real audio tracks

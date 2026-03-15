@@ -1,7 +1,7 @@
 FROM python:3.11-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg libsndfile1 build-essential git && \
+    ffmpeg libsndfile1 build-essential git curl && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -10,12 +10,28 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 RUN pip install --no-cache-dir essentia
 
-# Download CLAP checkpoint at build time (--insecure needed for corporate proxy)
-RUN apt-get update && apt-get install -y --no-install-recommends curl && \
-    rm -rf /var/lib/apt/lists/* && \
-    mkdir -p /models/clap && \
-    curl -k -L -o /models/clap/music_audioset_epoch_15_esc_90.14.pt \
-    "https://huggingface.co/lukewys/laion_clap/resolve/main/music_audioset_epoch_15_esc_90.14.pt"
+# Download model files at build time
+# CLAP checkpoint (~600MB), BERT tokenizer vocab, RoBERTa model (~500MB), Demucs (~80MB)
+RUN mkdir -p /models/clap /models/bert-base-uncased /models/roberta-base \
+             /root/.cache/torch/hub/checkpoints && \
+    curl -L -o /models/clap/music_audioset_epoch_15_esc_90.14.pt \
+    "https://huggingface.co/lukewys/laion_clap/resolve/main/music_audioset_epoch_15_esc_90.14.pt" && \
+    curl -L -o /models/bert-base-uncased/vocab.txt \
+    "https://raw.githubusercontent.com/microsoft/SDNet/master/bert_vocab_files/bert-base-uncased-vocab.txt" && \
+    curl -L -o /models/roberta-base/config.json \
+    "https://huggingface.co/roberta-base/resolve/main/config.json" && \
+    curl -L -o /models/roberta-base/pytorch_model.bin \
+    "https://huggingface.co/roberta-base/resolve/main/pytorch_model.bin" && \
+    curl -L -o /models/roberta-base/merges.txt \
+    "https://huggingface.co/roberta-base/resolve/main/merges.txt" && \
+    curl -L -o /models/roberta-base/vocab.json \
+    "https://huggingface.co/roberta-base/resolve/main/vocab.json" && \
+    curl -L -o /root/.cache/torch/hub/checkpoints/955717e8-8726e21a.th \
+    "https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/955717e8-8726e21a.th"
+
+# Bundle BERT tokenizer config files
+COPY models/bert-base-uncased/tokenizer_config.json /models/bert-base-uncased/tokenizer_config.json
+COPY models/bert-base-uncased/config.json /models/bert-base-uncased/config.json
 
 COPY . .
 

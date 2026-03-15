@@ -1,3 +1,31 @@
+import os
+
+# Redirect HuggingFace model loading to pre-downloaded local files.
+# CLAP hardcodes from_pretrained("bert-base-uncased") and from_pretrained("roberta-base")
+# at module import time. We intercept those calls to use bundled models in /models/.
+_LOCAL_MODEL_PATHS = {
+    "bert-base-uncased": "/models/bert-base-uncased",
+    "roberta-base": "/models/roberta-base",
+}
+
+import transformers
+
+_orig_bert_from_pretrained = transformers.BertTokenizer.from_pretrained.__func__
+def _patched_bert_from_pretrained(cls, name, *args, **kwargs):
+    for key, path in _LOCAL_MODEL_PATHS.items():
+        if isinstance(name, str) and key in name:
+            return _orig_bert_from_pretrained(cls, path, *args, **kwargs)
+    return _orig_bert_from_pretrained(cls, name, *args, **kwargs)
+transformers.BertTokenizer.from_pretrained = classmethod(_patched_bert_from_pretrained)
+
+_orig_model_from_pretrained = transformers.PreTrainedModel.from_pretrained.__func__
+def _patched_model_from_pretrained(cls, name, *args, **kwargs):
+    for key, path in _LOCAL_MODEL_PATHS.items():
+        if isinstance(name, str) and key in name:
+            return _orig_model_from_pretrained(cls, path, *args, **kwargs)
+    return _orig_model_from_pretrained(cls, name, *args, **kwargs)
+transformers.PreTrainedModel.from_pretrained = classmethod(_patched_model_from_pretrained)
+
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
