@@ -34,7 +34,7 @@ Existing tools (Mastering The Mix REFERENCE, iZotope Audiolens) do static A/B co
 
 5. **Spectral shape comparison should be relative**: Compare curves relative to a 1kHz anchor point, not in absolute dB. Absolute dB is meaningless when one track has been through a limiter.
 
-6. **The original CLI pipeline had features we dropped**: The 64-band mel EQ profile and blended search scoring (CLAP + EQ + HF gating) were more sophisticated than what we replaced them with. The 8-band display profile is fine for UI but too coarse for search. We need both.
+6. **Mastering detection must run on raw audio**: Peak normalization (which the pipeline applies for analysis consistency) makes every track's peak ~0dBFS, defeating peak-level-based mastering detection. Detection runs before normalization.
 
 ### Future enhancements (captured for continuity)
 
@@ -50,7 +50,7 @@ Existing tools (Mastering The Mix REFERENCE, iZotope Audiolens) do static A/B co
 - **PostgreSQL** via SQLAlchemy 2.0 (async via asyncpg for API routes, sync via psycopg2 for background workers)
 - **MinIO** (S3-compatible) for audio file storage
 - **CLAP** (LAION, HTSAT-base) for audio + text embeddings (512-dim shared space)
-- **Essentia** for beat tracking, BPM, key, time signature detection
+- **Essentia 2.1b6** for beat tracking, BPM, key, time signature detection (prebuilt x86_64 wheel, pinned version)
 - **Demucs** (htdemucs) for stem separation (drums/bass/vocals/other)
 - **FAISS** (flat inner-product) for vector similarity search
 - **librosa** for spectral analysis, onset detection, mel features
@@ -63,6 +63,7 @@ Existing tools (Mastering The Mix REFERENCE, iZotope Audiolens) do static A/B co
 
 ### Infrastructure
 - **docker-compose.yml** orchestrates 4 services: Postgres 16, MinIO, FastAPI backend, Next.js frontend
+- **Backend forced to `linux/amd64`** in docker-compose for cross-platform compatibility (essentia has no Linux aarch64 wheels; QEMU emulation on M1 Mac, native on Windows)
 - **Dockerfiles** for both backend and frontend (standalone Next.js output)
 
 ## Database Models
@@ -95,54 +96,118 @@ Existing tools (Mastering The Mix REFERENCE, iZotope Audiolens) do static A/B co
 
 1. File stored in S3 (MinIO), track record created (status=pending)
 2. Background worker:
-   a. Download from S3, load mono float32 at 44.1kHz
-   b. Essentia beat tracking -> BPM, key, scale, time signature, downbeat phase
-   c. Track-level energy curve (LUFS/centroid/onset/low-ratio over time)
-   d. Mastering state detection (crest factor, peak-to-LUFS, loudness histogram)
-   e. Demucs stem separation -> drums, bass, vocals, other
-   f. Stereo load for stereo analysis (if stereo source)
-   g. For each bar size (2, 4, 8, 16), beat-aligned window slicing:
-      - Core features: hf_perc_ratio, rms_dbfs, peak_dbfs, crest_db, flatness
-      - 64-band mel profiles: average, peak, variance
-      - 8-band spectral energy (for UI), crest, transient density
-      - Stereo features, section label (relative thresholds) + confidence
-      - Stem window slicing
-   h. Batch CLAP embedding of all mix + stem segments
-   i. Store everything to Postgres, status -> ready
+   a. Download from S3
+   b. **Mastering state detection on raw audio** (crest factor, peak level, loudness histogram) -- before normalization
+   c. Load mono float32 at 44.1kHz, peak-normalize to 0.95
+   d. Essentia beat tracking -> BPM, key, scale, time signature, downbeat phase
+   e. Track-level energy curve (LUFS/centroid/onset/low-ratio over time)
+   f. Demucs stem separation -> drums, bass, vocals, other
+   g. Stereo load for stereo analysis (if stereo source)
+   h. **Two-pass section analysis** for each bar size (2, 4, 8, 16):
+      - Pass 1: Collect all segments, compute per-segment features, build percentile distributions (p25/p50/p75 for RMS, onset density, HF ratio)
+      - Pass 2: Compute all features with relative thresholds using track percentiles:
+        - Core features: hf_perc_ratio, rms_dbfs, peak_dbfs, crest_db, flatness
+        - 64-band mel profiles: average, peak, variance (for search ranking)
+        - 8-band spectral energy (for UI), per-band crest, per-band transient density
+        - Stereo features (if stereo source)
+        - Section label using relative thresholds + confidence scoring
+        - Stem window slicing for per-stem embeddings
+   i. Batch CLAP embedding of all mix + stem segments
+   j. Store everything to Postgres, status -> ready
+
+## API Endpoints
+
+### Tracks
+- `POST /api/tracks/upload` -- Upload audio file, triggers background analysis
+- `GET /api/tracks` -- List tracks (filterable by status)
+- `GET /api/tracks/{id}` -- Track detail with all sections
+- `GET /api/tracks/{id}/energy` -- Energy curve data
+- `GET /api/tracks/{id}/stream` -- Presigned S3 URL for audio playback
+- `DELETE /api/tracks/{id}` -- Delete track + S3 object
+
+### Search
+- `POST /api/search` -- Upload query audio, find similar sections (blended CLAP + EQ scoring). Temporary query track is cleaned up after search completes.
+- `GET /api/search/text` -- Natural language search via CLAP text encoder
+- `POST /api/search/stems` -- Weighted per-stem similarity search
+- `GET /api/search/compare/{a}/{b}` -- Smart section comparison with mastering-aware recommendations
+- `GET /api/search/library/stats` -- Library statistics (track count, bars distribution, mastering distribution)
 
 ## Search Scoring
 
 Blended multi-signal scoring:
-- `score = w_clap * clap_sim + w_eq * eq_profile_cosine_sim + w_feat * feature_sim`
-- HF percussive ratio hard gate (skip spectrally incompatible matches)
-- Loudness normalization before comparison
+- `score = 0.7 * clap_cosine_sim + 0.3 * eq_profile_cosine_sim`
+- HF percussive ratio hard gate (reject spectrally incompatible matches)
 - DAE hybrid embeddings as optional mode (CLAP + engineered features)
-- All weights configurable per search request
+- Compare endpoint: spectral shape delta relative to 1kHz anchor, distinguishes arrangement differences (transient density) from tonal differences (EQ-fixable), mastering-aware recommendations with severity levels
 
 ## Docker & Infrastructure Notes
 
+- Backend container forced to `platform: linux/amd64` for essentia wheel compatibility
 - MinIO API on host port **9002** (9000 was in use). Console on **9001**.
-- Dockerfile downloads CLAP (~600MB), RoBERTa (~500MB), BERT vocab, Demucs (~80MB) at build time.
-- `main.py` monkey-patches HuggingFace `from_pretrained` to load from `/models/`.
-- Background worker uses sync psycopg2 (not async asyncpg) to avoid event loop conflicts.
-- `./backend:/app` volume mount with `--reload` -- code changes picked up live.
-- **Zscaler**: EY corporate proxy blocks huggingface.co. First build must be on unrestricted network.
+- Dockerfile downloads CLAP (~600MB), RoBERTa (~500MB), BERT vocab, Demucs (~80MB) at build time
+- Essentia pinned to `2.1b6.dev1389` (Jul 2025 release with prebuilt x86_64 manylinux wheels)
+- `main.py` monkey-patches HuggingFace `from_pretrained` to load from `/models/`
+- Background worker uses sync psycopg2 (not async asyncpg) to avoid event loop conflicts
+- `./backend:/app` volume mount with `--reload` -- code changes picked up live
+- **Zscaler**: EY corporate proxy blocks huggingface.co. First build must be on unrestricted network (home Mac). Then `docker save` the image and transfer to work PC.
 
 ## Current Status
 
-### Working
-- Full-stack scaffolding, upload/list/delete tracks
-- Essentia beat/BPM/key, Demucs stems, CLAP embeddings
-- 8-band spectral profiles, stereo width, energy curves
-- Waveform player, track detail page, text/stem search
+### Implemented & verified (code review complete)
+- Full-stack scaffolding: upload, list, delete, stream tracks
+- Essentia beat/BPM/key/time-sig detection (gold standard, no fallbacks)
+- Demucs stem separation (drums/bass/vocals/other)
+- CLAP audio + text embeddings (512-dim, L2-normalized)
+- Deep spectral analysis: 64-band mel profiles (avg/peak/variance), 8-band energy/crest/transient density
+- Mastering state detection (runs on raw audio before normalization)
+- Two-pass section labeling with relative thresholds and confidence scores
+- Blended search scoring (CLAP + EQ profile cosine + HF gating)
+- Smart comparison endpoint with mastering-aware, arrangement-vs-EQ-aware recommendations
+- Stereo width analysis (correlation, mid/side ratio, per-band width)
+- Track energy curves (LUFS, centroid, onset density, low ratio over time)
+- Text search and weighted stem search via CLAP shared embedding space
+- Waveform player with section regions, click-to-play, active section highlighting
+- Track detail page with section cards, bars/label filters, spectral profile visualization
+- Search page with text/stem/audio modes, stem weight sliders
+- Library page with drag-and-drop upload, status badges, auto-refresh
 
-### In progress (current sprint)
-- Phase 1: Deep spectral analysis (64-band profiles, per-band crest, transient density)
-- Phase 2: Mastering state detection
-- Phase 3: Blended search scoring
-- Phase 4: Relative section labels with confidence
-- Phase 5: Smart comparison recommendations
-- Phase 6: Energy curve frontend visualization
+### Bug fixes applied (latest commit)
+1. `sections_from_audio` 4-tuple unpacking crash -- fixed
+2. Mastering detection after peak normalization (always ~0dBFS) -- fixed: now runs on raw audio
+3. Orphan query track records accumulating in DB -- fixed: cleanup in finally block
+4. Empty `bars_distribution` in library stats -- fixed: now computes real distributions
+5. `band_transient_density` onset detection with wrong input format -- fixed: proper power-to-dB pipeline
+6. Duplicated `_eq_profile` in pipeline.py vs spectral.py -- fixed: single source of truth
+7. Frontend missing `band_crest`, `band_transient_density`, `section_label_confidence` types -- fixed
+8. `compareSections` untyped response -- fixed: proper `ComparisonResult` interface
+9. WaveformPlayer not updating region colors on section selection -- fixed: useEffect on activeSectionId
+10. ~80 lines of dead commented-out code -- removed
+
+### Pending / next steps
+- Docker build on home Mac (in progress -- `docker compose up --build` with `linux/amd64`)
+- First real track upload and end-to-end pipeline validation
+- Transfer Docker image to Windows work PC (`docker save` / `docker load`)
+- Validate search quality with real corpus
+- Alembic migrations setup
+- Authentication layer
+
+## Future Roadmap
+
+### Tier 1: Core Differentiators
+- **Phrase-by-phrase cross-reference matching**: Timeline UI showing your sections mapped to best-matching reference sections across the entire library
+- **Self-learning feedback loop**: User confirms/rejects matches, system tunes scoring weights per-genre over time
+- **A/B spectral diff visualization**: Side-by-side spectrograms with delta heat map overlay, arrangement vs EQ distinction
+
+### Tier 2: Producer Workflow
+- **Mix Coach mode**: Guided workflow sequencing comparison recommendations into actionable checklists
+- **Genre-aware analysis presets**: Different spectral weighting for EDM/hip-hop/acoustic/etc.
+- **Reference collection sharing**: Curate and share community reference track libraries
+
+### Tier 3: Technical Advancement
+- **Real-time WebSocket progress**: Replace polling with live analysis progress updates
+- **MuQ-MuLan model swap**: Drop-in replacement for CLAP with newer embedding model
+- **Offline desktop app**: Electron wrapper with embedded Python backend
+- **DAW plugin bridge**: AU/VST plugin sending audio directly to Resonance for real-time feedback
 
 ## Git Info
 
