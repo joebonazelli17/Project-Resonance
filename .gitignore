@@ -40,6 +40,11 @@ miniodata/
 backend/models/bert-base-uncased/vocab.txt
 backend/models/roberta-base/
 
+# Docker image exports
+*.tar
+resonance-backend/
+resonance-frontend/
+
 # IDE
 .vscode/
 .idea/
