@@ -183,23 +183,102 @@ Blended multi-signal scoring:
 9. WaveformPlayer not updating region colors on section selection -- fixed: useEffect on activeSectionId
 10. ~80 lines of dead commented-out code -- removed
 
+### Completed milestones
+- Docker build on home Mac with `linux/amd64` (all models downloaded successfully)
+- First real track upload and end-to-end pipeline validation (340 sections, all stems, CLAP embeddings)
+- Docker image transfer to Windows work PC via `docker save` / `docker load`
+- All 4 services running on Windows (db, minio, backend, frontend)
+
 ### Pending / next steps
-- Docker build on home Mac (in progress -- `docker compose up --build` with `linux/amd64`)
-- First real track upload and end-to-end pipeline validation
-- Transfer Docker image to Windows work PC (`docker save` / `docker load`)
-- Validate search quality with real corpus
+- Validate search quality with real corpus (multiple tracks)
+- Implement Anchor Track + Component Breakdown (see product vision below)
+- Controlled ground truth testing (see testing strategy below)
 - Alembic migrations setup
 - Authentication layer
+
+## Product Vision: Component-Level Referencing
+
+### Core concept
+Evolving from track-level similarity to component-level similarity. Instead of "what track sounds like mine?" we ask "which parts of my track match which parts of professional tracks?"
+
+### Anchor Track + Component Insights (critical UX model)
+Avoid "Frankenstein references" -- we do NOT recommend "use Track A drums, Track B bass, Track C vocals." This breaks musical cohesion.
+
+**Step 1 -- Anchor Track (Primary Reference):**
+Select best overall match, gated by section type (drop matches drop, verse matches verse) and similar BPM/structure.
+
+**Step 2 -- Component Comparison:**
+Compare user track vs anchor per-stem:
+```
+Drums:    42%
+Bass:     85%
+Melodics: 91%
+Vocals:   78%
+```
+
+**Step 3 -- Insight Layer:**
+System translates metrics into human guidance:
+- "Melodic elements are already near professional level."
+- "Drums have significantly lower energy and transient density."
+- "Bass is stylistically aligned but lacks punch."
+
+**Step 4 -- Optional Enhancement Suggestions:**
+If a component is weak, show closest component-specific matches as *secondary references*, not replacements:
+```
+Drums are below reference quality.
+Closest drum matches:
+  - Track X (91%)
+  - Track Y (88%)
+```
+
+### Section-type gating (required constraint)
+All similarity search must be gated by section label: drop matches drop, verse matches verse, build matches build. Otherwise results become misleading. Currently search matches by bar count but not section label -- this needs to be added.
+
+### User-controlled stem weighting
+User can specify focus areas: "Drums + Bass focus", "Ignore vocals", "Everything except vocals." Already partially implemented in stem search -- needs to be integrated into the anchor track flow.
+
+### Version Comparison Mode
+User uploads two versions of their own track (v1, v2). System outputs per-component diff:
+```
+Drums: +4.2 dB energy
+Transient density: +18%
+Stereo width: unchanged
+```
+This transforms Resonance into a mix iteration tool in addition to a reference tool.
+
+### UX Principles
+1. Start with anchor track (cohesion)
+2. Layer component insights (diagnosis)
+3. Offer optional alternatives (optimization)
+4. Never overwhelm user with raw metrics
+5. Translate everything into actionable guidance
+
+## Testing Strategy
+
+### Controlled ground truth testing
+Take a professional reference track, split stems, modify specific elements, re-upload. Verify the system detects the right changes.
+
+### Test types
+1. **Stem gain tests**: drums +6dB, bass -6dB. Expected: drum similarity increases, bass similarity decreases.
+2. **EQ tests**: boost highs, cut lows. Expected: spectral shift detected, transient density unchanged.
+3. **Transient density tests**: double hats (1/8 to 1/16), remove percussive elements. Expected: transient density changes without large spectral change.
+4. **Compression tests**: apply limiter, change crest factor. Expected: crest decreases, loudness increases.
+5. **Arrangement tests**: remove stems entirely, change section structure.
+
+### Validation goal
+System should be directionally correct -- not necessarily perfectly precise (Demucs separation is imperfect), but consistently pointing in the right direction.
 
 ## Future Roadmap
 
 ### Tier 1: Core Differentiators
+- **Anchor Track + Component Breakdown**: The core product experience described above. New API endpoint and frontend view. All underlying data already exists.
 - **Phrase-by-phrase cross-reference matching**: Timeline UI showing your sections mapped to best-matching reference sections across the entire library
 - **Self-learning feedback loop**: User confirms/rejects matches, system tunes scoring weights per-genre over time
 - **A/B spectral diff visualization**: Side-by-side spectrograms with delta heat map overlay, arrangement vs EQ distinction
 
 ### Tier 2: Producer Workflow
 - **Mix Coach mode**: Guided workflow sequencing comparison recommendations into actionable checklists
+- **Version Comparison Mode**: Upload v1 and v2 of a mix, get per-component diff showing what changed
 - **Genre-aware analysis presets**: Different spectral weighting for EDM/hip-hop/acoustic/etc.
 - **Reference collection sharing**: Curate and share community reference track libraries
 
