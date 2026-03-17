@@ -26,6 +26,7 @@ export default function TrackDetailPage({ params }: { params: Promise<{ id: stri
   const [track, setTrack] = useState<TrackDetail | null>(null);
   const [streamUrl, setStreamUrl] = useState<string | null>(null);
   const [activeSection, setActiveSection] = useState<TrackSection | null>(null);
+  const [seekCounter, setSeekCounter] = useState(0);
   const [barsFilter, setBarsFilter] = useState<number | null>(8);
   const [labelFilter, setLabelFilter] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -88,14 +89,16 @@ export default function TrackDetailPage({ params }: { params: Promise<{ id: stri
       {streamUrl && (
         <WaveformPlayer
           audioUrl={streamUrl}
-          sections={sections.filter((s, i) => {
-            // Only show non-overlapping regions on the waveform
-            if (i === 0) return true;
-            const prev = sections[i - 1];
-            return s.start_s >= prev.end_s - 0.1;
-          })}
+          sections={sections.reduce<typeof sections>((kept, s) => {
+            if (kept.length === 0 || s.start_s >= kept[kept.length - 1].end_s - 0.1) {
+              kept.push(s);
+            }
+            return kept;
+          }, [])}
           activeSectionId={activeSection?.id || null}
-          onSectionClick={(sec) => setActiveSection(sec as unknown as TrackSection)}
+          activeStartS={activeSection?.start_s ?? null}
+          seekCounter={seekCounter}
+          onSectionClick={(sec) => { setActiveSection(sec as unknown as TrackSection); setSeekCounter((c) => c + 1); }}
         />
       )}
 
@@ -154,7 +157,7 @@ export default function TrackDetailPage({ params }: { params: Promise<{ id: stri
         {sections.map((sec) => (
           <div
             key={sec.id}
-            onClick={() => setActiveSection(sec)}
+            onClick={() => { setActiveSection(sec); setSeekCounter((c) => c + 1); }}
             className={`bg-zinc-900/50 border rounded-xl p-4 cursor-pointer transition-all ${
               activeSection?.id === sec.id
                 ? "border-resonance-500 bg-resonance-500/5"

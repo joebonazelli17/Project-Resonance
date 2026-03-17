@@ -16,6 +16,8 @@ interface WaveformPlayerProps {
   audioUrl: string;
   sections?: WaveformSection[];
   activeSectionId?: string | null;
+  activeStartS?: number | null;
+  seekCounter?: number;
   onSectionClick?: (section: WaveformSection) => void;
   highlightRanges?: Array<{ start: number; end: number; color?: string }>;
   height?: number;
@@ -39,6 +41,8 @@ export default function WaveformPlayer({
   audioUrl,
   sections = [],
   activeSectionId,
+  activeStartS,
+  seekCounter = 0,
   onSectionClick,
   highlightRanges = [],
   height = 80,
@@ -84,6 +88,7 @@ export default function WaveformPlayer({
         waveColor: "#3f3f46",
         progressColor: "#5c7cfa",
         normalize: true,
+        interact: false,
         plugins: [regions],
       });
 
@@ -91,45 +96,12 @@ export default function WaveformPlayer({
         if (cancelled) return;
         setDuration(ws.getDuration());
         setReady(true);
-
-        sectionsRef.current.forEach((sec) => {
-          const color = SECTION_COLORS[sec.bars % SECTION_COLORS.length] || SECTION_COLORS[0];
-          regions.addRegion({
-            id: sec.id,
-            start: sec.start_s,
-            end: sec.end_s,
-            color: activeSectionId === sec.id ? "rgba(92, 124, 250, 0.35)" : color,
-            drag: false,
-            resize: false,
-            content: `${sec.bars}b`,
-          });
-        });
-
-        highlightRanges.forEach((r, i) => {
-          regions.addRegion({
-            id: `hl-${i}`,
-            start: r.start,
-            end: r.end,
-            color: r.color || "rgba(16, 185, 129, 0.3)",
-            drag: false,
-            resize: false,
-          });
-        });
       });
 
       ws.on("timeupdate", (t: number) => setCurrentTime(t));
       ws.on("play", () => setPlaying(true));
       ws.on("pause", () => setPlaying(false));
       ws.on("finish", () => setPlaying(false));
-
-      regions.on("region-clicked", (region: RegionHandle, e: MouseEvent) => {
-        e.stopPropagation();
-        if (onSectionClickRef.current) {
-          const sec = sectionsRef.current.find((s) => s.id === region.id);
-          if (sec) onSectionClickRef.current(sec);
-        }
-        region.play();
-      });
 
       ws.load(audioUrl);
       wsRef.current = ws;
@@ -147,19 +119,47 @@ export default function WaveformPlayer({
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [audioUrl]);
 
+  // Rebuild regions whenever sections list or active section changes
   useEffect(() => {
     const regions = regionsRef.current;
     if (!regions || !ready) return;
-    const allRegions = regions.getRegions();
-    for (const region of allRegions) {
-      if (region.id.startsWith("hl-")) continue;
-      const sec = sectionsRef.current.find((s) => s.id === region.id);
-      if (!sec) continue;
+
+    // Clear all existing regions
+    regions.clearRegions();
+
+    // Add section regions
+    sections.forEach((sec) => {
       const baseColor = SECTION_COLORS[sec.bars % SECTION_COLORS.length] || SECTION_COLORS[0];
-      const newColor = activeSectionId === sec.id ? "rgba(92, 124, 250, 0.35)" : baseColor;
-      region.setOptions({ color: newColor });
-    }
-  }, [activeSectionId, ready]);
+      const color = activeSectionId === sec.id ? "rgba(92, 124, 250, 0.35)" : baseColor;
+      regions.addRegion({
+        id: sec.id,
+        start: sec.start_s,
+        end: sec.end_s,
+        color,
+        drag: false,
+        resize: false,
+        content: `${sec.bars}b`,
+      });
+    });
+
+    // Add highlight ranges
+    highlightRanges.forEach((r, i) => {
+      regions.addRegion({
+        id: `hl-${i}`,
+        start: r.start,
+        end: r.end,
+        color: r.color || "rgba(16, 185, 129, 0.3)",
+        drag: false,
+        resize: false,
+      });
+    });
+  }, [sections, activeSectionId, highlightRanges, ready]);
+
+  useEffect(() => {
+    if (activeStartS == null || !ready || !wsRef.current || duration <= 0) return;
+    const ratio = activeStartS / duration;
+    wsRef.current.seekTo(Math.max(0, Math.min(1, ratio)));
+  }, [activeStartS, seekCounter, ready, duration]);
 
   const togglePlay = useCallback(() => {
     if (wsRef.current) wsRef.current.playPause();
@@ -167,10 +167,23 @@ export default function WaveformPlayer({
 
   return (
     <div className="space-y-2">
-      <div
-        ref={containerRef}
-        className="rounded-lg overflow-hidden bg-zinc-900/50 border border-zinc-800"
-      />
+      <div className="relative">
+        <div
+          ref={containerRef}
+          className="rounded-lg overflow-hidden bg-zinc-900/50 border border-zinc-800"
+        />
+        <div
+          className="absolute inset-0 z-10 cursor-pointer"
+          onClick={(e) => {
+            if (!wsRef.current || !ready || duration <= 0) return;
+            const rect = e.currentTarget.getBoundingClientRect();
+            const ratio = (e.clientX - rect.left) / rect.width;
+            const wasPlaying = playing;
+            wsRef.current.seekTo(Math.max(0, Math.min(1, ratio)));
+            if (wasPlaying) wsRef.current.play();
+          }}
+        />
+      </div>
       <div className="flex items-center gap-3">
         <button
           onClick={togglePlay}
