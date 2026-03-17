@@ -18,6 +18,27 @@ function StatusBadge({ status }: { status: string }) {
   );
 }
 
+function ElapsedTimer({ since }: { since: string }) {
+  const [elapsed, setElapsed] = useState("");
+
+  useEffect(() => {
+    const start = new Date(since).getTime();
+    const tick = () => {
+      const s = Math.floor((Date.now() - start) / 1000);
+      const m = Math.floor(s / 60);
+      const sec = s % 60;
+      setElapsed(`${m}:${String(sec).padStart(2, "0")}`);
+    };
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, [since]);
+
+  return (
+    <span className="text-xs text-amber-400/70 font-mono tabular-nums">{elapsed}</span>
+  );
+}
+
 export default function LibraryPage() {
   const [tracks, setTracks] = useState<Track[]>([]);
   const [uploading, setUploading] = useState(false);
@@ -119,6 +140,9 @@ export default function LibraryPage() {
               </div>
             </Link>
             <div className="flex items-center gap-3">
+              {(track.status === "analyzing" || track.status === "pending") && (
+                <ElapsedTimer since={track.updated_at} />
+              )}
               <StatusBadge status={track.status} />
               <button
                 onClick={() => handleDelete(track.id)}

@@ -57,9 +57,21 @@ def delete_file(key: str, bucket: str | None = None) -> None:
     client.delete_object(Bucket=bucket, Key=key)
 
 
+def _get_public_client():
+    """Client using the browser-accessible endpoint for presigned URLs."""
+    return boto3.client(
+        "s3",
+        endpoint_url=settings.S3_PUBLIC_ENDPOINT,
+        aws_access_key_id=settings.S3_ACCESS_KEY,
+        aws_secret_access_key=settings.S3_SECRET_KEY,
+        region_name=settings.S3_REGION,
+        config=BotoConfig(signature_version="s3v4"),
+    )
+
+
 def generate_presigned_url(key: str, expires_in: int = 3600, bucket: str | None = None) -> str:
     bucket = bucket or settings.S3_BUCKET_TRACKS
-    client = _get_client()
+    client = _get_public_client()
     return client.generate_presigned_url(
         "get_object",
         Params={"Bucket": bucket, "Key": key},

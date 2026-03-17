@@ -1,0 +1,13 @@
+{
+  "model_type": "bart",
+  "tokenizer_class": "BartTokenizer",
+  "vocab_size": 50265,
+  "max_len": 1024,
+  "bos_token": "<s>",
+  "eos_token": "</s>",
+  "sep_token": "</s>",
+  "cls_token": "<s>",
+  "unk_token": "<unk>",
+  "pad_token": "<pad>",
+  "mask_token": "<mask>"
+}

@@ -26,7 +26,7 @@ export default function TrackDetailPage({ params }: { params: Promise<{ id: stri
   const [track, setTrack] = useState<TrackDetail | null>(null);
   const [streamUrl, setStreamUrl] = useState<string | null>(null);
   const [activeSection, setActiveSection] = useState<TrackSection | null>(null);
-  const [barsFilter, setBarsFilter] = useState<number | null>(null);
+  const [barsFilter, setBarsFilter] = useState<number | null>(8);
   const [labelFilter, setLabelFilter] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -88,7 +88,12 @@ export default function TrackDetailPage({ params }: { params: Promise<{ id: stri
       {streamUrl && (
         <WaveformPlayer
           audioUrl={streamUrl}
-          sections={sections}
+          sections={sections.filter((s, i) => {
+            // Only show non-overlapping regions on the waveform
+            if (i === 0) return true;
+            const prev = sections[i - 1];
+            return s.start_s >= prev.end_s - 0.1;
+          })}
           activeSectionId={activeSection?.id || null}
           onSectionClick={(sec) => setActiveSection(sec as unknown as TrackSection)}
         />

@@ -1,30 +1,43 @@
 import os
 
+# Block ALL HuggingFace network access -- Zscaler intercepts these requests.
+# All models must be pre-downloaded in /models/ at Docker build time.
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
 # Redirect HuggingFace model loading to pre-downloaded local files.
-# CLAP hardcodes from_pretrained("bert-base-uncased") and from_pretrained("roberta-base")
-# at module import time. We intercept those calls to use bundled models in /models/.
 _LOCAL_MODEL_PATHS = {
     "bert-base-uncased": "/models/bert-base-uncased",
     "roberta-base": "/models/roberta-base",
+    "facebook/bart-base": "/models/bart-base",
 }
 
 import transformers
 
-_orig_bert_from_pretrained = transformers.BertTokenizer.from_pretrained.__func__
-def _patched_bert_from_pretrained(cls, name, *args, **kwargs):
-    for key, path in _LOCAL_MODEL_PATHS.items():
-        if isinstance(name, str) and key in name:
-            return _orig_bert_from_pretrained(cls, path, *args, **kwargs)
-    return _orig_bert_from_pretrained(cls, name, *args, **kwargs)
-transformers.BertTokenizer.from_pretrained = classmethod(_patched_bert_from_pretrained)
+# Patch all tokenizer/model from_pretrained calls to use local paths
+def _make_patched_from_pretrained(orig_fn):
+    def _patched(cls, name, *args, **kwargs):
+        for key, path in _LOCAL_MODEL_PATHS.items():
+            if isinstance(name, str) and key in name:
+                kwargs["local_files_only"] = True
+                return orig_fn(cls, path, *args, **kwargs)
+        return orig_fn(cls, name, *args, **kwargs)
+    return _patched
 
-_orig_model_from_pretrained = transformers.PreTrainedModel.from_pretrained.__func__
-def _patched_model_from_pretrained(cls, name, *args, **kwargs):
-    for key, path in _LOCAL_MODEL_PATHS.items():
-        if isinstance(name, str) and key in name:
-            return _orig_model_from_pretrained(cls, path, *args, **kwargs)
-    return _orig_model_from_pretrained(cls, name, *args, **kwargs)
-transformers.PreTrainedModel.from_pretrained = classmethod(_patched_model_from_pretrained)
+for _cls in [
+    transformers.BertTokenizer,
+    transformers.RobertaTokenizer,
+    transformers.RobertaTokenizerFast,
+    transformers.BartTokenizer,
+    transformers.PreTrainedModel,
+    transformers.AutoTokenizer,
+    transformers.AutoModel,
+]:
+    try:
+        _orig = _cls.from_pretrained.__func__
+        _cls.from_pretrained = classmethod(_make_patched_from_pretrained(_orig))
+    except (AttributeError, TypeError):
+        pass
 
 from contextlib import asynccontextmanager
 

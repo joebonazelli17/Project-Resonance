@@ -148,6 +148,10 @@ export async function compareSections(a: string, b: string): Promise<ComparisonR
 
 export async function getStreamUrl(id: string): Promise<string> {
   const data = await request<{ url: string }>(`/tracks/${id}/stream`);
+  // URL may be a presigned S3 URL or a relative /api/tracks/{id}/audio path
+  if (data.url.startsWith("/")) {
+    return `${API_BASE.replace("/api", "")}${data.url}`;
+  }
   return data.url;
 }
 

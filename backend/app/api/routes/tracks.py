@@ -10,7 +10,7 @@ from sqlalchemy.orm import selectinload
 
 from app.core.config import settings
 from app.core.database import get_db
-from app.core.storage import upload_file, generate_presigned_url, delete_file
+from app.core.storage import upload_file, download_file, generate_presigned_url, delete_file
 from app.models.track import Track, TrackStatus
 from app.schemas.track import TrackOut, TrackDetailOut, TrackWithCurveOut
 from app.workers.analyze import run_analysis
@@ -91,12 +91,48 @@ async def get_track_energy(track_id: uuid.UUID, db: AsyncSession = Depends(get_d
 
 @router.get("/{track_id}/stream")
 async def stream_track(track_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
+    """Return a URL for audio playback. Points to presigned S3 for browser-native
+    formats, or to the /audio endpoint for transcoding (AIFF etc)."""
     result = await db.execute(select(Track).where(Track.id == track_id))
     track = result.scalar_one_or_none()
     if not track:
         raise HTTPException(404, "Track not found")
-    url = generate_presigned_url(track.s3_key)
-    return {"url": url}
+
+    ext = Path(track.filename).suffix.lower()
+    if ext in (".mp3", ".wav", ".flac", ".ogg"):
+        return {"url": generate_presigned_url(track.s3_key)}
+
+    # For AIFF and other non-browser formats, use the transcode endpoint
+    return {"url": f"/api/tracks/{track_id}/audio"}
+
+
+@router.get("/{track_id}/audio")
+async def audio_transcode(track_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
+    """Transcode audio to WAV for browser playback."""
+    import subprocess, tempfile, os
+    from fastapi.responses import FileResponse
+
+    result = await db.execute(select(Track).where(Track.id == track_id))
+    track = result.scalar_one_or_none()
+    if not track:
+        raise HTTPException(404, "Track not found")
+
+    tmp_dir = tempfile.mkdtemp()
+    src_path = os.path.join(tmp_dir, track.filename)
+    wav_path = os.path.join(tmp_dir, f"{track.id}.wav")
+
+    with open(src_path, "wb") as f:
+        f.write(download_file(track.s3_key))
+
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", src_path, "-ac", "2", "-ar", "44100", wav_path],
+        capture_output=True, timeout=120,
+    )
+
+    if os.path.exists(wav_path):
+        return FileResponse(wav_path, media_type="audio/wav", filename=f"{track.id}.wav")
+
+    raise HTTPException(500, "Transcoding failed")
 
 
 @router.delete("/{track_id}")
