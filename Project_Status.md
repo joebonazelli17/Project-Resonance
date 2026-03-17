@@ -112,13 +112,15 @@ Existing tools (Mastering The Mix REFERENCE, iZotope Audiolens) do static A/B co
         - Stereo features (if stereo source)
         - Section label using relative thresholds + confidence scoring
         - Stem window slicing for per-stem embeddings
-   i. Batch CLAP embedding of all mix + stem segments
-   j. Store everything to Postgres, status -> ready
+   i. **Phase 1**: Batch CLAP embedding of mix segments only -> mark track as READY
+   j. Store core features + mix embeddings to Postgres
+   k. **Phase 2**: Batch CLAP embedding of stem segments (runs after track is already usable)
+   l. Update existing sections with stem embeddings
 
 ## API Endpoints
 
 ### Tracks
-- `POST /api/tracks/upload` -- Upload audio file, triggers background analysis
+- `POST /api/tracks/upload` -- Upload audio file, spawns analysis in separate subprocess (API stays responsive)
 - `GET /api/tracks` -- List tracks (filterable by status)
 - `GET /api/tracks/{id}` -- Track detail with all sections
 - `GET /api/tracks/{id}/energy` -- Energy curve data
@@ -148,8 +150,9 @@ Blended multi-signal scoring:
 - Dockerfile downloads CLAP (~600MB), RoBERTa (~500MB), BERT vocab, Demucs (~80MB) at build time
 - Essentia pinned to `2.1b6.dev1389` (Jul 2025 release with prebuilt x86_64 manylinux wheels)
 - `app.core.patches` module monkey-patches HuggingFace `from_pretrained` to load from `/models/` (imported by both main.py and standalone workers)
+- Analysis runs in separate subprocess via `spawn_analysis()` -- API stays responsive, models cold-load per track (persistent worker planned)
 - Background worker uses sync psycopg2 (not async asyncpg) to avoid event loop conflicts
-- `./backend:/app` volume mount with `--reload` -- code changes picked up live
+- `./backend:/app` volume mount with `--reload` -- code changes picked up live (note: auto-reload kills in-flight analysis)
 - **Zscaler**: EY corporate proxy blocks huggingface.co. First build must be on unrestricted network (home Mac). Then `docker save` the image and transfer to work PC.
 
 ## Current Status
@@ -176,19 +179,25 @@ Blended multi-signal scoring:
 - Delete confirmation dialogs on library and track detail pages
 
 ### Performance optimizations (latest)
+- **Two-phase analysis**: Phase 1 (core features + mix CLAP) marks track READY in ~7 min. Phase 2 (stem embeddings) runs after, updating existing sections. Track is usable immediately after Phase 1.
+- **Subprocess analysis**: `spawn_analysis()` runs in a separate Python process so the API stays fully responsive during analysis. No more frozen UI while tracks process.
+- **Hop size 4**: Changed `DEFAULT_HOP_BARS` from 2 to 4, cutting segment count roughly in half (~260 segments for a 6-min track vs ~472).
+- **Thread count 6**: Changed `OMP_NUM_THREADS` / `MKL_NUM_THREADS` / `TORCH_NUM_THREADS` from 1 to 6 on a 6-core Ryzen.
 - **Parallel Demucs + beat detection**: ThreadPoolExecutor runs stem separation and beat/BPM/key detection concurrently
-- **Single CLAP batch**: All segments (mix + 4 stems) embedded in one batch call instead of 5 separate calls
-- **Pre-resample to 48kHz**: Full track + stems resampled once upfront, then sliced per section (eliminates ~1700 per-segment resample operations)
+- **Pre-resample to 48kHz**: Full track + stems resampled once upfront, then sliced per section (eliminates per-segment resample operations)
 - **Cached mel spectrograms**: `compute_eq_profiles()` computes avg/peak/variance from single mel spectrogram (was 3 separate spectrograms per section)
 - **Combined STFT**: `compute_band_crest_and_transient_density()` computes both from single STFT (was 2 per section)
 - **GPU auto-detection**: Startup logs platform, torch version, GPU availability, thread count
 - **Timing instrumentation**: Each pipeline step logs elapsed time for profiling
+- **Next improvement**: Persistent worker process (models load once, reused across tracks) to eliminate cold-start penalty
 
 ### Infrastructure fixes (latest)
+- **Next.js API proxy**: Frontend uses `rewrites()` in next.config.ts to proxy `/api/*` to backend. Eliminates CORS and IPv4/IPv6 issues. Upload goes directly to backend to bypass proxy body size limits.
 - **HF patches extracted to `app.core.patches`**: Shared module imported by both `main.py` and standalone workers -- fixes Zscaler SSL errors when running analysis outside uvicorn
-- **IPv4/IPv6 fix**: Frontend API_BASE uses `127.0.0.1` (Docker only binds IPv4), CORS allows both `localhost` and `127.0.0.1` origins
+- **CORS**: Allows both `localhost:3000` and `127.0.0.1:3000` origins
 - **Enum case fix**: TrackStatus values uppercase to match Postgres enum, schema validator lowercases for frontend
 - **Soft delete**: Delete endpoint sets status to DELETED by default, permanent delete requires `?permanent=true`
+- **Docker frontend disabled for dev**: Stop Docker frontend container, run `npx next dev` locally for live code changes
 
 ### Bug fixes applied
 1. `sections_from_audio` 4-tuple unpacking crash -- fixed

@@ -1,4 +1,4 @@
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000/api";
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || "/api";
 
 export interface Track {
   id: string;
@@ -106,7 +106,13 @@ export async function getTrack(id: string): Promise<TrackDetail> {
 export async function uploadTrack(file: File): Promise<Track> {
   const form = new FormData();
   form.append("file", file);
-  return request("/tracks/upload", { method: "POST", body: form });
+  // Upload directly to backend (bypass Next.js proxy for large files)
+  const res = await fetch("http://127.0.0.1:8000/api/tracks/upload", { method: "POST", body: form });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail || res.statusText);
+  }
+  return res.json();
 }
 
 export async function deleteTrack(id: string): Promise<void> {
@@ -148,10 +154,7 @@ export async function compareSections(a: string, b: string): Promise<ComparisonR
 
 export async function getStreamUrl(id: string): Promise<string> {
   const data = await request<{ url: string }>(`/tracks/${id}/stream`);
-  // URL may be a presigned S3 URL or a relative /api/tracks/{id}/audio path
-  if (data.url.startsWith("/")) {
-    return `${API_BASE.replace("/api", "")}${data.url}`;
-  }
+  // URL is either a presigned S3 URL (http://...) or a relative path (/api/...)
   return data.url;
 }
 

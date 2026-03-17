@@ -27,7 +27,7 @@ class Settings(BaseSettings):
 
     # Analysis defaults
     DEFAULT_BARS_LIST: list[int] = [2, 4, 8, 16]
-    DEFAULT_HOP_BARS: int = 2
+    DEFAULT_HOP_BARS: int = 4
     DEFAULT_BEATS_PER_BAR: int = 4
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}

@@ -46,10 +46,10 @@ services:
       S3_SECRET_KEY: minioadmin
       S3_BUCKET_TRACKS: resonance-tracks
       CLAP_DEVICE: cpu
-      OMP_NUM_THREADS: "1"
-      MKL_NUM_THREADS: "1"
-      VECLIB_MAXIMUM_THREADS: "1"
-      TORCH_NUM_THREADS: "4"
+      OMP_NUM_THREADS: "6"
+      MKL_NUM_THREADS: "6"
+      VECLIB_MAXIMUM_THREADS: "6"
+      TORCH_NUM_THREADS: "6"
       CORS_ORIGINS: '["http://localhost:3000","http://127.0.0.1:3000"]'
     ports:
       - "8000:8000"

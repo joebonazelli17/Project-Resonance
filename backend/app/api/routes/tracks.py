@@ -13,7 +13,7 @@ from app.core.database import get_db
 from app.core.storage import upload_file, download_file, generate_presigned_url, delete_file
 from app.models.track import Track, TrackStatus
 from app.schemas.track import TrackOut, TrackDetailOut, TrackWithCurveOut
-from app.workers.analyze import run_analysis
+from app.workers.analyze import spawn_analysis
 
 router = APIRouter(prefix="/tracks", tags=["tracks"])
 
@@ -22,7 +22,6 @@ AUDIO_EXTS = {".wav", ".mp3", ".flac", ".m4a", ".aiff", ".aif"}
 
 @router.post("/upload", response_model=TrackOut)
 async def upload_track(
-    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     db: AsyncSession = Depends(get_db),
 ):
@@ -49,7 +48,7 @@ async def upload_track(
     await db.commit()
     await db.refresh(track)
 
-    background_tasks.add_task(run_analysis, str(track_id))
+    spawn_analysis(str(track_id))
 
     return track
 
