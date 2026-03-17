@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, use } from "react";
+import { useEffect, useMemo, useState, use } from "react";
 import { useRouter } from "next/navigation";
 import { getTrack, getStreamUrl, deleteTrack, formatTime, type TrackDetail, type TrackSection } from "@/lib/api";
 import WaveformPlayer from "@/components/WaveformPlayer";
@@ -46,6 +46,21 @@ export default function TrackDetailPage({ params }: { params: Promise<{ id: stri
     })();
   }, [id]);
 
+  // Compute track-wide median band energies for relative spectral display
+  const bandNames = ["sub", "low", "low_mid", "mid", "high_mid", "presence", "brilliance", "air"];
+  const bandMedians = useMemo(() => {
+    const medians: Record<string, number> = {};
+    if (!track) return medians;
+    const allSecs = track.sections.filter((s) => s.band_energies);
+    if (allSecs.length === 0) return medians;
+    for (const band of bandNames) {
+      const vals = allSecs.map((s) => s.band_energies?.[band] ?? -96).sort((a, b) => a - b);
+      medians[band] = vals[Math.floor(vals.length / 2)];
+    }
+    return medians;
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [track]);
+
   if (loading) return <p className="text-zinc-500 py-12 text-center">Loading track...</p>;
   if (error) return <p className="text-red-400 py-12 text-center">{error}</p>;
   if (!track) return null;
@@ -54,7 +69,7 @@ export default function TrackDetailPage({ params }: { params: Promise<{ id: stri
     if (barsFilter && s.bars !== barsFilter) return false;
     if (labelFilter && s.section_label !== labelFilter) return false;
     return true;
-  });
+  }).sort((a, b) => a.start_s - b.start_s || a.bars - b.bars);
   const barsValues = [...new Set(track.sections.map((s) => s.bars))].sort((a, b) => a - b);
   const labelValues = [...new Set(track.sections.map((s) => s.section_label).filter(Boolean))] as string[];
 
@@ -90,12 +105,19 @@ export default function TrackDetailPage({ params }: { params: Promise<{ id: stri
       {streamUrl && (
         <WaveformPlayer
           audioUrl={streamUrl}
-          sections={sections.reduce<typeof sections>((kept, s) => {
-            if (kept.length === 0 || s.start_s >= kept[kept.length - 1].end_s - 0.1) {
-              kept.push(s);
-            }
-            return kept;
-          }, [])}
+          sections={(() => {
+            // When showing all bar sizes, pick the largest for waveform regions to avoid overlap
+            const waveformBars = barsFilter || Math.max(...barsValues, 8);
+            return track.sections
+              .filter((s) => s.bars === waveformBars && (!labelFilter || s.section_label === labelFilter))
+              .sort((a, b) => a.start_s - b.start_s)
+              .reduce<typeof sections>((kept, s) => {
+                if (kept.length === 0 || s.start_s >= kept[kept.length - 1].end_s - 0.1) {
+                  kept.push(s);
+                }
+                return kept;
+              }, []);
+          })()}
           activeSectionId={activeSection?.id || null}
           activeStartS={activeSection?.start_s ?? null}
           seekCounter={seekCounter}
@@ -197,18 +219,26 @@ export default function TrackDetailPage({ params }: { params: Promise<{ id: stri
               <div className="mt-3 pt-3 border-t border-zinc-800">
                 <p className="text-[10px] uppercase tracking-wider text-zinc-600 mb-1.5">Spectral Profile</p>
                 <div className="flex gap-0.5 items-end h-10">
-                  {["sub", "low", "low_mid", "mid", "high_mid", "presence", "brilliance", "air"].map((band) => {
-                    const val = sec.band_energies?.[band] ?? -96;
-                    const pct = Math.max(0, Math.min(100, ((val + 60) / 60) * 100));
-                    return (
-                      <div key={band} className="flex-1 flex flex-col items-center gap-0.5">
-                        <div className="w-full bg-zinc-800 rounded-sm overflow-hidden" style={{ height: "32px" }}>
-                          <div className="w-full bg-resonance-500/60 rounded-sm" style={{ height: `${pct}%`, marginTop: `${100 - pct}%` }} />
+                  {(() => {
+                    // A-weighting offsets (dB) at band center frequencies to match human perception
+                    // sub(40Hz) low(125Hz) low_mid(350Hz) mid(1kHz) high_mid(3kHz) presence(6kHz) brilliance(12kHz) air(18kHz)
+                    const aWeight = [-34.6, -16.1, -3.5, 0, 1.2, 1.0, -1.1, -6.6];
+                    const raw = bandNames.map((b) => sec.band_energies?.[b] ?? -96);
+                    const weighted = raw.map((v, i) => v + aWeight[i]);
+                    const maxVal = Math.max(...weighted);
+                    return bandNames.map((band, i) => {
+                      const relative = weighted[i] - maxVal;
+                      const pct = Math.max(0, Math.min(100, ((relative + 30) / 30) * 100));
+                      return (
+                        <div key={band} className="flex-1 flex flex-col items-center gap-0.5">
+                          <div className="w-full bg-zinc-800 rounded-sm overflow-hidden" style={{ height: "32px" }}>
+                            <div className="w-full bg-resonance-500/60 rounded-sm" style={{ height: `${pct}%`, marginTop: `${100 - pct}%` }} />
+                          </div>
+                          <span className="text-[8px] text-zinc-600">{band.replace("_", "")}</span>
                         </div>
-                        <span className="text-[8px] text-zinc-600">{band.replace("_", "")}</span>
-                      </div>
-                    );
-                  })}
+                      );
+                    });
+                  })()}
                 </div>
               </div>
             )}

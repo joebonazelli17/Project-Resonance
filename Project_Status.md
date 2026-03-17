@@ -215,6 +215,12 @@ Blended multi-signal scoring:
 13. Section card click not seeking waveform -- fixed: activeStartS + seekCounter props
 14. Waveform click-to-seek blocked by region overlays -- fixed: transparent click overlay at z-10
 
+### UI fixes (latest)
+- **Spectral profile A-weighted**: Raw band energies are perceptually weighted (A-weighting curve) and peak-normalized per section, so the display matches what you'd see on a spectrum analyzer. Without this, low frequencies always dominated due to physics.
+- **Section cards sorted**: Cards now sorted by start time (ascending), then by bar size.
+- **Waveform regions on "All" filter**: When no specific bar filter is selected, waveform regions use the largest available bar size to avoid overlap. Previously, mixing all bar sizes made most regions invisible.
+- **useMemo hook order fix**: Moved `bandMedians` computation before early returns to satisfy React's rules of hooks.
+
 ### Completed milestones
 - Docker build on home Mac with `linux/amd64` (all models downloaded successfully)
 - First real track upload and end-to-end pipeline validation (328 sections, all stems, CLAP embeddings)
@@ -222,13 +228,16 @@ Blended multi-signal scoring:
 - All 4 services running on Windows (db, minio, backend, frontend)
 - Waveform playback working with AIFF transcoding and click-to-seek
 - Analysis pipeline optimized (parallel steps, cached spectrograms, single CLAP batch)
+- 3 tracks loaded and analyzed: John Summit - Tears, Seven Lions - The Sirens, SØNIN - Passion
+- Spectral profile visualization calibrated with A-weighting for perceptually accurate display
 
-### Pending / next steps
-- Build Docker image natively on Windows (eliminate QEMU emulation for 2-3x speedup)
-- Multi-arch Docker images for Mac ARM64 + Windows x86_64
-- Validate search quality with real corpus (multiple tracks)
+### Pending / next steps (prioritized)
+- **Ground truth calibration** (NEXT): User will manually annotate 5-10 tracks with correct section labels, BPM, and structure. Compare against tool output to tune section labeling thresholds and identify systematic errors. All analysis data is accessible via API for comparison.
+- **Persistent worker process**: Models load once and stay in memory, accepting jobs via queue. Eliminates cold-start penalty (~2 min model load per track). Currently each `spawn_analysis()` subprocess cold-loads all models.
 - Implement Anchor Track + Component Breakdown (see product vision below)
-- Controlled ground truth testing (see testing strategy below)
+- Validate search quality with real corpus (multiple tracks)
+- Controlled ground truth testing with modified stems (see testing strategy below)
+- Build Docker image natively on Windows (eliminate QEMU emulation)
 - Alembic migrations setup
 - Authentication layer
 
