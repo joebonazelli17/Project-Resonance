@@ -10,110 +10,119 @@ BAND_NAMES = ["sub", "low", "low_mid", "mid", "high_mid", "presence", "brillianc
 
 # --------------- 64-band mel profiles (for search ranking) ---------------
 
-def compute_eq_profile(y: np.ndarray, sr: int, n_bands: int = 64) -> np.ndarray:
-    """
-    64-band log-mel average profile with temporal and spectral smoothing.
-    Returns L2-normalized float32 vector. Used for search ranking.
-    """
+def _compute_log_mel(y: np.ndarray, sr: int, n_bands: int = 64) -> np.ndarray:
+    """Compute log-mel spectrogram (shared across eq profile functions)."""
     S = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=n_bands, power=2.0, center=False)
-    M = np.log1p(S)
+    return np.log1p(S)
+
+
+def compute_eq_profiles(y: np.ndarray, sr: int, n_bands: int = 64) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Compute all three 64-band eq profiles (avg, peak, variance) from a single
+    mel spectrogram. Returns (avg, peak, variance) as L2-normalized float32 vectors.
+    """
+    M = _compute_log_mel(y, sr, n_bands)
+    k_f = np.ones(3, dtype=np.float32) / 3
+
+    # Average profile with temporal + spectral smoothing
+    M_smooth = M
     if M.shape[1] >= 3:
         k_t = np.ones(5, dtype=np.float32) / 5
-        M = np.apply_along_axis(lambda x: np.convolve(x, k_t, mode="same"), axis=1, arr=M)
-    v = M.mean(axis=1)
-    if v.size >= 3:
-        k_f = np.ones(3, dtype=np.float32) / 3
-        v = np.convolve(v, k_f, mode="same")
-    v = v.astype(np.float32, copy=False)
-    v /= (np.linalg.norm(v) + 1e-12)
-    return v
+        M_smooth = np.apply_along_axis(lambda x: np.convolve(x, k_t, mode="same"), axis=1, arr=M)
+    v_avg = M_smooth.mean(axis=1)
+    if v_avg.size >= 3:
+        v_avg = np.convolve(v_avg, k_f, mode="same")
+    v_avg = v_avg.astype(np.float32, copy=False)
+    v_avg /= (np.linalg.norm(v_avg) + 1e-12)
+
+    # Peak profile
+    v_peak = M.max(axis=1)
+    if v_peak.size >= 3:
+        v_peak = np.convolve(v_peak, k_f, mode="same")
+    v_peak = v_peak.astype(np.float32, copy=False)
+    v_peak /= (np.linalg.norm(v_peak) + 1e-12)
+
+    # Variance profile
+    v_var = M.var(axis=1).astype(np.float32, copy=False)
+    v_var /= (np.linalg.norm(v_var) + 1e-12)
+
+    return v_avg, v_peak, v_var
+
+
+def compute_eq_profile(y: np.ndarray, sr: int, n_bands: int = 64) -> np.ndarray:
+    """64-band log-mel average profile. For standalone use (e.g. search)."""
+    avg, _, _ = compute_eq_profiles(y, sr, n_bands)
+    return avg
 
 
 def compute_eq_profile_peak(y: np.ndarray, sr: int, n_bands: int = 64) -> np.ndarray:
-    """
-    64-band log-mel PEAK profile -- max energy per band across time.
-    Captures headroom and arrangement density (loud transient events).
-    """
-    S = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=n_bands, power=2.0, center=False)
-    M = np.log1p(S)
-    v = M.max(axis=1)
-    if v.size >= 3:
-        k_f = np.ones(3, dtype=np.float32) / 3
-        v = np.convolve(v, k_f, mode="same")
-    v = v.astype(np.float32, copy=False)
-    v /= (np.linalg.norm(v) + 1e-12)
-    return v
+    """64-band log-mel peak profile. For standalone use."""
+    _, peak, _ = compute_eq_profiles(y, sr, n_bands)
+    return peak
 
 
 def compute_eq_profile_variance(y: np.ndarray, sr: int, n_bands: int = 64) -> np.ndarray:
-    """
-    64-band log-mel VARIANCE profile -- how much each band moves over time.
-    High variance = rhythmic content (hats, percussion). Low = sustained (pads, bass).
-    Distinguishes 1/16th hats from 1/8th hats: same avg energy but different variance.
-    """
-    S = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=n_bands, power=2.0, center=False)
-    M = np.log1p(S)
-    v = M.var(axis=1)
-    v = v.astype(np.float32, copy=False)
-    v /= (np.linalg.norm(v) + 1e-12)
-    return v
+    """64-band log-mel variance profile. For standalone use."""
+    _, _, var = compute_eq_profiles(y, sr, n_bands)
+    return var
 
 
 # --------------- Per-band crest & transient density (8-band) ---------------
 
-def compute_band_crest(y: np.ndarray, sr: int) -> dict[str, float]:
+def compute_band_crest_and_transient_density(
+    y: np.ndarray, sr: int
+) -> tuple[dict[str, float], dict[str, float]]:
     """
-    Per-band crest factor (peak-to-RMS ratio in dB) across 8 frequency bands.
-    Low crest = compressed/limited. High crest = dynamic/unprocessed.
+    Compute per-band crest factor AND transient density from a single STFT.
+    Returns (band_crest, band_transient_density).
     """
-    S = np.abs(librosa.stft(y, n_fft=4096, hop_length=512))
-    freqs = librosa.fft_frequencies(sr=sr, n_fft=4096)
-    result = {}
-    for i, name in enumerate(BAND_NAMES):
-        lo, hi = BAND_EDGES_HZ[i], BAND_EDGES_HZ[i + 1]
-        mask = (freqs >= lo) & (freqs < hi)
-        if mask.any():
-            band = S[mask, :]
-            rms = float(np.sqrt(np.mean(band ** 2)))
-            peak = float(band.max())
-            crest = float(20 * np.log10((peak + 1e-9) / (rms + 1e-9)))
-            result[name] = round(crest, 2)
-        else:
-            result[name] = 0.0
-    return result
-
-
-def compute_band_transient_density(y: np.ndarray, sr: int) -> dict[str, float]:
-    """
-    Per-band transient density (onset events per second) across 8 frequency bands.
-    Distinguishes arrangement density from EQ balance: 1/16th hats produce
-    high transient density in brilliance/air bands, while 1/8th hats produce lower.
-    """
-    duration = len(y) / sr
-    if duration < 0.1:
-        return {name: 0.0 for name in BAND_NAMES}
-
     hop_length = 512
     S = np.abs(librosa.stft(y, n_fft=4096, hop_length=hop_length))
     freqs = librosa.fft_frequencies(sr=sr, n_fft=4096)
-    result = {}
+    duration = len(y) / sr
+
+    crest_result = {}
+    td_result = {}
     for i, name in enumerate(BAND_NAMES):
         lo, hi = BAND_EDGES_HZ[i], BAND_EDGES_HZ[i + 1]
         mask = (freqs >= lo) & (freqs < hi)
-        if mask.any():
-            band_power = (S[mask, :] ** 2).sum(axis=0)
+        if not mask.any():
+            crest_result[name] = 0.0
+            td_result[name] = 0.0
+            continue
+
+        band = S[mask, :]
+
+        # Crest factor
+        rms = float(np.sqrt(np.mean(band ** 2)))
+        peak = float(band.max())
+        crest_result[name] = round(float(20 * np.log10((peak + 1e-9) / (rms + 1e-9))), 2)
+
+        # Transient density
+        if duration >= 0.1:
+            band_power = (band ** 2).sum(axis=0)
             band_db = librosa.power_to_db(band_power[np.newaxis, :], ref=np.max)
-            onset_env = librosa.onset.onset_strength(
-                S=band_db, sr=sr, hop_length=hop_length
-            )
+            onset_env = librosa.onset.onset_strength(S=band_db, sr=sr, hop_length=hop_length)
             onsets = librosa.onset.onset_detect(
-                onset_envelope=onset_env, sr=sr,
-                hop_length=hop_length, units='time'
+                onset_envelope=onset_env, sr=sr, hop_length=hop_length, units='time'
             )
-            result[name] = round(len(onsets) / duration, 2)
+            td_result[name] = round(len(onsets) / duration, 2)
         else:
-            result[name] = 0.0
-    return result
+            td_result[name] = 0.0
+
+    return crest_result, td_result
+
+
+def compute_band_crest(y: np.ndarray, sr: int) -> dict[str, float]:
+    """Per-band crest factor. For standalone use."""
+    crest, _ = compute_band_crest_and_transient_density(y, sr)
+    return crest
+
+
+def compute_band_transient_density(y: np.ndarray, sr: int) -> dict[str, float]:
+    """Per-band transient density. For standalone use."""
+    _, td = compute_band_crest_and_transient_density(y, sr)
+    return td
 
 
 # --------------- Mastering state detection ---------------

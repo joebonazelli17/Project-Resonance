@@ -1,43 +1,4 @@
-import os
-
-# Block ALL HuggingFace network access -- Zscaler intercepts these requests.
-# All models must be pre-downloaded in /models/ at Docker build time.
-os.environ["HF_HUB_OFFLINE"] = "1"
-os.environ["TRANSFORMERS_OFFLINE"] = "1"
-
-# Redirect HuggingFace model loading to pre-downloaded local files.
-_LOCAL_MODEL_PATHS = {
-    "bert-base-uncased": "/models/bert-base-uncased",
-    "roberta-base": "/models/roberta-base",
-    "facebook/bart-base": "/models/bart-base",
-}
-
-import transformers
-
-# Patch all tokenizer/model from_pretrained calls to use local paths
-def _make_patched_from_pretrained(orig_fn):
-    def _patched(cls, name, *args, **kwargs):
-        for key, path in _LOCAL_MODEL_PATHS.items():
-            if isinstance(name, str) and key in name:
-                kwargs["local_files_only"] = True
-                return orig_fn(cls, path, *args, **kwargs)
-        return orig_fn(cls, name, *args, **kwargs)
-    return _patched
-
-for _cls in [
-    transformers.BertTokenizer,
-    transformers.RobertaTokenizer,
-    transformers.RobertaTokenizerFast,
-    transformers.BartTokenizer,
-    transformers.PreTrainedModel,
-    transformers.AutoTokenizer,
-    transformers.AutoModel,
-]:
-    try:
-        _orig = _cls.from_pretrained.__func__
-        _cls.from_pretrained = classmethod(_make_patched_from_pretrained(_orig))
-    except (AttributeError, TypeError):
-        pass
+import app.core.patches  # noqa: F401 -- must be first to patch HF before any ML imports
 
 from contextlib import asynccontextmanager
 
@@ -50,8 +11,18 @@ from app.core.storage import ensure_bucket
 from app.api.routes import health, tracks, search
 
 
+def _log_hardware():
+    import torch
+    import platform
+    gpu = "CUDA" if torch.cuda.is_available() else "MPS" if (getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()) else "none"
+    print(f"[resonance] platform={platform.machine()} torch={torch.__version__} gpu={gpu} threads={torch.get_num_threads()}")
+    if gpu == "CUDA":
+        print(f"[resonance] GPU: {torch.cuda.get_device_name(0)}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _log_hardware()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     ensure_bucket()

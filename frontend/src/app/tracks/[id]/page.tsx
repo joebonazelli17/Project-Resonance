@@ -59,6 +59,7 @@ export default function TrackDetailPage({ params }: { params: Promise<{ id: stri
   const labelValues = [...new Set(track.sections.map((s) => s.section_label).filter(Boolean))] as string[];
 
   const handleDelete = async () => {
+    if (!confirm("Are you sure you want to delete this track?")) return;
     await deleteTrack(track.id);
     router.push("/");
   };

@@ -12,7 +12,7 @@ class Settings(BaseSettings):
 
     # S3 / MinIO
     S3_ENDPOINT: str = "http://minio:9000"
-    S3_PUBLIC_ENDPOINT: str = "http://localhost:9002"
+    S3_PUBLIC_ENDPOINT: str = "http://127.0.0.1:9002"
     S3_ACCESS_KEY: str = "minioadmin"
     S3_SECRET_KEY: str = "minioadmin"
     S3_BUCKET_TRACKS: str = "resonance-tracks"
@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     CLAP_DEVICE: str = "cpu"
 
     # CORS
-    CORS_ORIGINS: list[str] = ["http://localhost:3000"]
+    CORS_ORIGINS: list[str] = ["http://localhost:3000", "http://127.0.0.1:3000"]
 
     # Analysis defaults
     DEFAULT_BARS_LIST: list[int] = [2, 4, 8, 16]

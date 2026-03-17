@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import app.core.patches  # noqa: F401 -- must be early to patch HF before ML imports
+
 import tempfile
 import uuid
 from pathlib import Path
@@ -50,7 +52,9 @@ def _compute_percentiles(values: list[float]) -> dict:
 
 
 def run_analysis(track_id: str) -> None:
-    """Full analysis pipeline with deep spectral profiling and mastering detection."""
+    """Optimized analysis pipeline: parallel steps, single CLAP batch, cached spectrograms."""
+    import time as _time
+    from concurrent.futures import ThreadPoolExecutor
 
     with SyncSession() as db:
         result = db.execute(select(Track).where(Track.id == uuid.UUID(track_id)))
@@ -61,6 +65,7 @@ def run_analysis(track_id: str) -> None:
         s3_key = track.s3_key
 
     _sync_update_status(track_id, TrackStatus.ANALYZING)
+    t0 = _time.monotonic()
 
     try:
         with tempfile.TemporaryDirectory() as tmp:
@@ -69,27 +74,23 @@ def run_analysis(track_id: str) -> None:
 
             from app.engine.pipeline import load_mono, _extra_features, _slice_by_bpm_fallback
             from app.engine.tempo_bars import detect_beats_bpm_key, slice_by_bars_from_beats
-            from app.engine.embeddings import embed_audio_batch
+            from app.engine.embeddings import embed_audio_batch, _resample_to_48k
             from app.engine.spectral import (
                 compute_band_energies, compute_energy_curve,
                 compute_stereo_features, detect_section_label,
-                compute_eq_profile, compute_eq_profile_peak, compute_eq_profile_variance,
-                compute_band_crest, compute_band_transient_density,
+                compute_eq_profiles,
+                compute_band_crest_and_transient_density,
                 detect_mastering_state,
             )
             import librosa as _lr
 
-            # Load raw audio first for mastering detection (before normalization)
-            import librosa as _lr_raw
-            y_raw, sr = _lr_raw.load(str(local_path), sr=44100, mono=True)
+            # --- Step 1: Load audio + mastering detection ---
+            t1 = _time.monotonic()
+            y_raw, sr = _lr.load(str(local_path), sr=44100, mono=True)
             mastering_state = detect_mastering_state(y_raw, sr)
-            del y_raw
 
             y, sr = load_mono(local_path)
             duration_s = float(y.shape[0] / sr) if y.size else 0.0
-            beats, bpm, key, scale, bpb, phase = detect_beats_bpm_key(y, sr)
-
-            energy_curve = compute_energy_curve(y, sr, hop_s=0.5)
 
             y_stereo = None
             try:
@@ -98,17 +99,49 @@ def run_analysis(track_id: str) -> None:
                     y_stereo = y_st
             except Exception:
                 pass
+            print(f"[analyze] load+mastering: {_time.monotonic()-t1:.1f}s")
 
+            # --- Step 2: Parallel - Demucs + Beat detection ---
+            t2 = _time.monotonic()
             stems = {}
-            try:
-                from app.engine.stems import separate_stems
-                stems = separate_stems(y, sr)
-                print(f"[analyze] Demucs separated {list(stems.keys())} for {filename}")
-            except Exception as ex:
-                print(f"[analyze] Demucs failed, continuing without stems: {ex}")
+            beats_result = [None]
 
-            # --- Pass 1: collect all segments and raw features for percentile computation ---
-            raw_segments = []  # (seg, s, e, b0, b1, bars, s_i, e_i)
+            def _run_demucs():
+                nonlocal stems
+                try:
+                    from app.engine.stems import separate_stems
+                    stems = separate_stems(y, sr)
+                    print(f"[analyze] Demucs separated {list(stems.keys())} in {_time.monotonic()-t2:.1f}s")
+                except Exception as ex:
+                    print(f"[analyze] Demucs failed: {ex}")
+
+            def _run_beats():
+                beats_result[0] = detect_beats_bpm_key(y, sr)
+                print(f"[analyze] beats/bpm/key in {_time.monotonic()-t2:.1f}s")
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                f_demucs = pool.submit(_run_demucs)
+                f_beats = pool.submit(_run_beats)
+                f_beats.result()
+                f_demucs.result()
+
+            beats, bpm, key, scale, bpb, phase = beats_result[0]
+            energy_curve = compute_energy_curve(y, sr, hop_s=0.5)
+            print(f"[analyze] parallel step: {_time.monotonic()-t2:.1f}s total")
+
+            # --- Step 3: Pre-resample full tracks to 48kHz for CLAP ---
+            t3 = _time.monotonic()
+            y_48k = _resample_to_48k(y, sr)
+            stems_48k = {}
+            for name in STEM_NAMES:
+                if name in stems:
+                    stems_48k[name] = _resample_to_48k(stems[name], sr)
+            del y_raw  # free memory
+            print(f"[analyze] pre-resample to 48k: {_time.monotonic()-t3:.1f}s")
+
+            # --- Step 4: Build windows + Pass 1 (percentiles) ---
+            t4 = _time.monotonic()
+            raw_segments = []
 
             for bars in settings.DEFAULT_BARS_LIST:
                 wins = slice_by_bars_from_beats(
@@ -134,11 +167,7 @@ def run_analysis(track_id: str) -> None:
                         continue
                     raw_segments.append((seg, s, e, b0, b1, bars, s_i, e_i))
 
-            # Compute features for percentile calculation
-            all_rms = []
-            all_onset = []
-            all_hf = []
-            pre_feats = []
+            all_rms, all_onset, all_hf, pre_feats = [], [], [], []
             for (seg, s, e, b0, b1, bars, s_i, e_i) in raw_segments:
                 feats = _extra_features(seg, sr)
                 onset_env = _lr.onset.onset_strength(y=seg, sr=sr)
@@ -151,22 +180,27 @@ def run_analysis(track_id: str) -> None:
             rms_pct = _compute_percentiles(all_rms)
             onset_pct = _compute_percentiles(all_onset)
             hf_pct = _compute_percentiles(all_hf)
+            print(f"[analyze] windowing + pass1: {_time.monotonic()-t4:.1f}s ({len(raw_segments)} segments)")
 
-            # --- Pass 2: compute all features with relative thresholds ---
-            seg_audio = []
-            seg_stem_audio = {name: [] for name in STEM_NAMES}
+            # --- Step 5: Pass 2 - features with cached spectrograms ---
+            t5 = _time.monotonic()
             seg_meta = []
+            # Build ALL CLAP segments at once: mix + stems, using pre-resampled 48k audio
+            all_clap_segments = []  # list of 48k segments for single batch
+            clap_segment_map = []   # (type, index) to map back: ("mix", i) or ("drums", i)
+
+            sr_48k = 48000
+            samples_per_sec_48k = sr_48k
 
             for idx, (seg, s, e, b0, b1, bars, s_i, e_i) in enumerate(raw_segments):
                 feats, onset_d = pre_feats[idx]
 
+                # Combined band crest + transient density (single STFT)
+                band_cr, band_td = compute_band_crest_and_transient_density(seg, sr)
                 band_e = compute_band_energies(seg, sr)
-                band_cr = compute_band_crest(seg, sr)
-                band_td = compute_band_transient_density(seg, sr)
 
-                eq_avg = compute_eq_profile(seg, sr)
-                eq_peak = compute_eq_profile_peak(seg, sr)
-                eq_var = compute_eq_profile_variance(seg, sr)
+                # Combined eq profiles (single mel spectrogram)
+                eq_avg, eq_peak, eq_var = compute_eq_profiles(seg, sr)
 
                 stereo_f = None
                 if y_stereo is not None:
@@ -187,7 +221,6 @@ def run_analysis(track_id: str) -> None:
                     track_hf_percentiles=hf_pct,
                 )
 
-                seg_audio.append(seg)
                 seg_meta.append({
                     "start_s": s, "end_s": e, "bars": bars,
                     "bar_start": b0, "bar_end": b1,
@@ -204,27 +237,44 @@ def run_analysis(track_id: str) -> None:
                     **feats,
                 })
 
+                # Slice pre-resampled 48k audio (no per-segment resampling)
+                s_48 = int(round(s * samples_per_sec_48k))
+                e_48 = int(round(e * samples_per_sec_48k))
+
+                mix_seg_48 = y_48k[s_48:e_48]
+                if mix_seg_48.shape[0] >= samples_per_sec_48k:
+                    all_clap_segments.append(mix_seg_48)
+                    clap_segment_map.append(("mix", idx))
+
                 for name in STEM_NAMES:
-                    if name in stems:
-                        stem_seg = stems[name][s_i:e_i]
-                        seg_stem_audio[name].append(stem_seg if stem_seg.shape[0] >= sr else None)
+                    if name in stems_48k:
+                        stem_seg_48 = stems_48k[name][s_48:e_48]
+                        if stem_seg_48.shape[0] >= samples_per_sec_48k:
+                            all_clap_segments.append(stem_seg_48)
+                            clap_segment_map.append((name, idx))
+
+            print(f"[analyze] features pass2: {_time.monotonic()-t5:.1f}s")
+
+            # --- Step 6: Single CLAP batch for ALL segments (mix + stems) ---
+            t6 = _time.monotonic()
+            all_embeddings = None
+            if all_clap_segments:
+                # Pass pre_resampled=True to skip redundant resampling
+                all_embeddings = embed_audio_batch(all_clap_segments, 48000)
+            print(f"[analyze] CLAP embed ({len(all_clap_segments)} segments): {_time.monotonic()-t6:.1f}s")
+
+            # Map embeddings back to mix + stems per section
+            mix_embeddings = [None] * len(seg_meta)
+            stem_embeddings = {name: {} for name in STEM_NAMES}
+            if all_embeddings is not None:
+                for emb_idx, (emb_type, seg_idx) in enumerate(clap_segment_map):
+                    if emb_type == "mix":
+                        mix_embeddings[seg_idx] = all_embeddings[emb_idx]
                     else:
-                        seg_stem_audio[name].append(None)
+                        stem_embeddings[emb_type][seg_idx] = all_embeddings[emb_idx]
 
-            # --- Batch embed ---
-            mix_embeddings = embed_audio_batch(seg_audio, sr) if seg_audio else None
-
-            stem_embeddings = {}
-            for name in STEM_NAMES:
-                valid_segs = [(i, s) for i, s in enumerate(seg_stem_audio[name]) if s is not None]
-                if valid_segs:
-                    indices, segs = zip(*valid_segs)
-                    embs = embed_audio_batch(list(segs), sr)
-                    stem_embeddings[name] = {idx: embs[j] for j, idx in enumerate(indices)}
-                else:
-                    stem_embeddings[name] = {}
-
-            # --- Persist ---
+            # --- Step 7: Persist ---
+            t7 = _time.monotonic()
             with SyncSession() as db:
                 result = db.execute(select(Track).where(Track.id == uuid.UUID(track_id)))
                 track = result.scalar_one_or_none()
@@ -243,7 +293,7 @@ def run_analysis(track_id: str) -> None:
                         eq_peak = meta.pop("_eq_profile_peak")
                         eq_var = meta.pop("_eq_profile_variance")
 
-                        mix_emb = _embedding_to_bytes(mix_embeddings[i]) if mix_embeddings is not None else None
+                        mix_emb = _embedding_to_bytes(mix_embeddings[i]) if mix_embeddings[i] is not None else None
                         drums_emb = _embedding_to_bytes(stem_embeddings["drums"][i]) if i in stem_embeddings.get("drums", {}) else None
                         bass_emb = _embedding_to_bytes(stem_embeddings["bass"][i]) if i in stem_embeddings.get("bass", {}) else None
                         vocals_emb = _embedding_to_bytes(stem_embeddings["vocals"][i]) if i in stem_embeddings.get("vocals", {}) else None
@@ -264,7 +314,9 @@ def run_analysis(track_id: str) -> None:
                         db.add(section)
                     db.commit()
 
-            print(f"[analyze] {filename}: {len(seg_meta)} sections, mastering={mastering_state}, energy_curve={len(energy_curve.get('times', []))} pts")
+            total = _time.monotonic() - t0
+            print(f"[analyze] {filename}: {len(seg_meta)} sections, mastering={mastering_state}, "
+                  f"energy_curve={len(energy_curve.get('times', []))} pts, total={total:.1f}s")
 
     except Exception as exc:
         _sync_update_status(track_id, TrackStatus.FAILED, error=str(exc))

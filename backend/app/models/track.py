@@ -12,10 +12,11 @@ from app.core.database import Base
 
 
 class TrackStatus(str, enum.Enum):
-    PENDING = "pending"
-    ANALYZING = "analyzing"
-    READY = "ready"
-    FAILED = "failed"
+    PENDING = "PENDING"
+    ANALYZING = "ANALYZING"
+    READY = "READY"
+    FAILED = "FAILED"
+    DELETED = "DELETED"
 
 
 class Track(Base):

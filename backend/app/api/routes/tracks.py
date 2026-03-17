@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, BackgroundTasks
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, BackgroundTasks
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -136,15 +136,24 @@ async def audio_transcode(track_id: uuid.UUID, db: AsyncSession = Depends(get_db
 
 
 @router.delete("/{track_id}")
-async def delete_track(track_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
+async def delete_track(
+    track_id: uuid.UUID,
+    permanent: bool = Query(default=False, description="Permanently delete track and audio file"),
+    db: AsyncSession = Depends(get_db),
+):
     result = await db.execute(select(Track).where(Track.id == track_id))
     track = result.scalar_one_or_none()
     if not track:
         raise HTTPException(404, "Track not found")
-    try:
-        delete_file(track.s3_key)
-    except Exception:
-        pass
-    await db.delete(track)
-    await db.commit()
-    return {"deleted": str(track_id)}
+    if permanent:
+        try:
+            delete_file(track.s3_key)
+        except Exception:
+            pass
+        await db.delete(track)
+        await db.commit()
+        return {"deleted": str(track_id), "permanent": True}
+    else:
+        track.status = TrackStatus.DELETED
+        await db.commit()
+        return {"deleted": str(track_id), "permanent": False}

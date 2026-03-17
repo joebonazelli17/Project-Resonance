@@ -74,6 +74,7 @@ export default function LibraryPage() {
   };
 
   const handleDelete = async (id: string) => {
+    if (!confirm("Are you sure you want to delete this track?")) return;
     try {
       await deleteTrack(id);
       await refresh();

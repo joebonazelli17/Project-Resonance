@@ -123,7 +123,8 @@ Existing tools (Mastering The Mix REFERENCE, iZotope Audiolens) do static A/B co
 - `GET /api/tracks/{id}` -- Track detail with all sections
 - `GET /api/tracks/{id}/energy` -- Energy curve data
 - `GET /api/tracks/{id}/stream` -- Presigned S3 URL for audio playback
-- `DELETE /api/tracks/{id}` -- Delete track + S3 object
+- `DELETE /api/tracks/{id}` -- Soft-delete track (set status=deleted). Add `?permanent=true` to permanently delete track + S3 object.
+- `GET /api/tracks/{id}/audio` -- Transcode audio to WAV for browser playback (AIFF, etc.)
 
 ### Search
 - `POST /api/search` -- Upload query audio, find similar sections (blended CLAP + EQ scoring). Temporary query track is cleaned up after search completes.
@@ -146,7 +147,7 @@ Blended multi-signal scoring:
 - MinIO API on host port **9002** (9000 was in use). Console on **9001**.
 - Dockerfile downloads CLAP (~600MB), RoBERTa (~500MB), BERT vocab, Demucs (~80MB) at build time
 - Essentia pinned to `2.1b6.dev1389` (Jul 2025 release with prebuilt x86_64 manylinux wheels)
-- `main.py` monkey-patches HuggingFace `from_pretrained` to load from `/models/`
+- `app.core.patches` module monkey-patches HuggingFace `from_pretrained` to load from `/models/` (imported by both main.py and standalone workers)
 - Background worker uses sync psycopg2 (not async asyncpg) to avoid event loop conflicts
 - `./backend:/app` volume mount with `--reload` -- code changes picked up live
 - **Zscaler**: EY corporate proxy blocks huggingface.co. First build must be on unrestricted network (home Mac). Then `docker save` the image and transfer to work PC.
@@ -154,7 +155,7 @@ Blended multi-signal scoring:
 ## Current Status
 
 ### Implemented & verified (code review complete)
-- Full-stack scaffolding: upload, list, delete, stream tracks
+- Full-stack scaffolding: upload, list, delete (soft-delete by default), stream tracks
 - Essentia beat/BPM/key/time-sig detection (gold standard, no fallbacks)
 - Demucs stem separation (drums/bass/vocals/other)
 - CLAP audio + text embeddings (512-dim, L2-normalized)
@@ -166,12 +167,30 @@ Blended multi-signal scoring:
 - Stereo width analysis (correlation, mid/side ratio, per-band width)
 - Track energy curves (LUFS, centroid, onset density, low ratio over time)
 - Text search and weighted stem search via CLAP shared embedding space
-- Waveform player with section regions, click-to-play, active section highlighting
+- Waveform player with section regions, click-to-seek overlay, section card seeking
 - Track detail page with section cards, bars/label filters, spectral profile visualization
+- Dynamic waveform regions: update when switching bar size or section type filters
 - Search page with text/stem/audio modes, stem weight sliders
-- Library page with drag-and-drop upload, status badges, auto-refresh
+- Library page with drag-and-drop upload, status badges, elapsed timer, auto-refresh
+- AIFF browser playback via ffmpeg transcode endpoint (AIFF -> WAV)
+- Delete confirmation dialogs on library and track detail pages
 
-### Bug fixes applied (latest commit)
+### Performance optimizations (latest)
+- **Parallel Demucs + beat detection**: ThreadPoolExecutor runs stem separation and beat/BPM/key detection concurrently
+- **Single CLAP batch**: All segments (mix + 4 stems) embedded in one batch call instead of 5 separate calls
+- **Pre-resample to 48kHz**: Full track + stems resampled once upfront, then sliced per section (eliminates ~1700 per-segment resample operations)
+- **Cached mel spectrograms**: `compute_eq_profiles()` computes avg/peak/variance from single mel spectrogram (was 3 separate spectrograms per section)
+- **Combined STFT**: `compute_band_crest_and_transient_density()` computes both from single STFT (was 2 per section)
+- **GPU auto-detection**: Startup logs platform, torch version, GPU availability, thread count
+- **Timing instrumentation**: Each pipeline step logs elapsed time for profiling
+
+### Infrastructure fixes (latest)
+- **HF patches extracted to `app.core.patches`**: Shared module imported by both `main.py` and standalone workers -- fixes Zscaler SSL errors when running analysis outside uvicorn
+- **IPv4/IPv6 fix**: Frontend API_BASE uses `127.0.0.1` (Docker only binds IPv4), CORS allows both `localhost` and `127.0.0.1` origins
+- **Enum case fix**: TrackStatus values uppercase to match Postgres enum, schema validator lowercases for frontend
+- **Soft delete**: Delete endpoint sets status to DELETED by default, permanent delete requires `?permanent=true`
+
+### Bug fixes applied
 1. `sections_from_audio` 4-tuple unpacking crash -- fixed
 2. Mastering detection after peak normalization (always ~0dBFS) -- fixed: now runs on raw audio
 3. Orphan query track records accumulating in DB -- fixed: cleanup in finally block
@@ -182,14 +201,22 @@ Blended multi-signal scoring:
 8. `compareSections` untyped response -- fixed: proper `ComparisonResult` interface
 9. WaveformPlayer not updating region colors on section selection -- fixed: useEffect on activeSectionId
 10. ~80 lines of dead commented-out code -- removed
+11. AIFF browser playback failure -- fixed: transcode endpoint via ffmpeg
+12. Waveform overcrowded with overlapping regions -- fixed: default 8-bar filter, non-overlapping dedup
+13. Section card click not seeking waveform -- fixed: activeStartS + seekCounter props
+14. Waveform click-to-seek blocked by region overlays -- fixed: transparent click overlay at z-10
 
 ### Completed milestones
 - Docker build on home Mac with `linux/amd64` (all models downloaded successfully)
-- First real track upload and end-to-end pipeline validation (340 sections, all stems, CLAP embeddings)
+- First real track upload and end-to-end pipeline validation (328 sections, all stems, CLAP embeddings)
 - Docker image transfer to Windows work PC via `docker save` / `docker load`
 - All 4 services running on Windows (db, minio, backend, frontend)
+- Waveform playback working with AIFF transcoding and click-to-seek
+- Analysis pipeline optimized (parallel steps, cached spectrograms, single CLAP batch)
 
 ### Pending / next steps
+- Build Docker image natively on Windows (eliminate QEMU emulation for 2-3x speedup)
+- Multi-arch Docker images for Mac ARM64 + Windows x86_64
 - Validate search quality with real corpus (multiple tracks)
 - Implement Anchor Track + Component Breakdown (see product vision below)
 - Controlled ground truth testing (see testing strategy below)

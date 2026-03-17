@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 
 class TrackOut(BaseModel):
@@ -20,6 +20,11 @@ class TrackOut(BaseModel):
     mastering_state: str | None = None
     created_at: datetime
     updated_at: datetime
+
+    @field_validator("status", mode="before")
+    @classmethod
+    def lowercase_status(cls, v: str) -> str:
+        return v.lower() if isinstance(v, str) else v
 
     model_config = {"from_attributes": True}
 
