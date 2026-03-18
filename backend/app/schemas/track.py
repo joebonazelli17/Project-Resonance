@@ -55,6 +55,7 @@ class TrackSectionOut(BaseModel):
     stereo_features: dict | None = None
     band_crest: dict | None = None
     band_transient_density: dict | None = None
+    stem_energies: dict | None = None
 
     model_config = {"from_attributes": True}
 

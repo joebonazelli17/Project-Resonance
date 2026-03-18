@@ -53,6 +53,23 @@ async def upload_track(
     return track
 
 
+@router.post("/{track_id}/reanalyze")
+async def reanalyze_track(track_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
+    """Delete existing sections and re-run analysis."""
+    from app.models.track import TrackSection
+    result = await db.execute(select(Track).where(Track.id == track_id))
+    track = result.scalar_one_or_none()
+    if not track:
+        raise HTTPException(404, "Track not found")
+    await db.execute(select(TrackSection).where(TrackSection.track_id == track_id))
+    from sqlalchemy import delete
+    await db.execute(delete(TrackSection).where(TrackSection.track_id == track_id))
+    track.status = TrackStatus.PENDING
+    await db.commit()
+    spawn_analysis(str(track_id))
+    return {"status": "reanalysis started", "track_id": str(track_id)}
+
+
 @router.get("", response_model=list[TrackOut])
 async def list_tracks(
     status: str | None = None,

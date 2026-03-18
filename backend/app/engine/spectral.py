@@ -1,8 +1,21 @@
 """Multi-band spectral analysis, deep profiling, and stereo width computation."""
 from __future__ import annotations
 
+import pickle
+from pathlib import Path
+
 import numpy as np
 import librosa
+
+# Load trained section classifier if available
+_CLASSIFIER = None
+_CLASSIFIER_PATH = Path(__file__).resolve().parents[2] / "models" / "section_classifier.pkl"
+if _CLASSIFIER_PATH.exists():
+    try:
+        with open(_CLASSIFIER_PATH, "rb") as _f:
+            _CLASSIFIER = pickle.load(_f)
+    except Exception:
+        pass
 
 BAND_EDGES_HZ = [20, 60, 250, 500, 2000, 4000, 8000, 16000, 20000]
 BAND_NAMES = ["sub", "low", "low_mid", "mid", "high_mid", "presence", "brilliance", "air"]
@@ -283,6 +296,27 @@ def compute_stereo_features(y_stereo: np.ndarray, sr: int) -> dict:
     }
 
 
+def compute_stem_energies(
+    stems: dict,
+    sr: int,
+    start_sample: int,
+    end_sample: int,
+) -> dict[str, float]:
+    """Compute RMS in dBFS for each stem in a given sample range."""
+    result = {}
+    for name in ("drums", "bass", "vocals", "other"):
+        if name in stems:
+            seg = stems[name][start_sample:end_sample]
+            if seg.shape[0] > 0:
+                rms = float(np.sqrt(np.mean(seg ** 2)))
+                result[name] = round(float(20 * np.log10(rms + 1e-12)), 2)
+            else:
+                result[name] = -96.0
+        else:
+            result[name] = -96.0
+    return result
+
+
 def detect_section_label(
     rms_dbfs: float,
     onset_density: float,
@@ -293,81 +327,215 @@ def detect_section_label(
     track_rms_percentiles: dict | None = None,
     track_onset_percentiles: dict | None = None,
     track_hf_percentiles: dict | None = None,
+    stem_energies: dict | None = None,
+    stem_percentiles: dict | None = None,
+    rms_delta: float = 0.0,
+    rms_trend: float = 0.0,
 ) -> tuple[str, float]:
     """
-    Section labeling using relative thresholds within the track's own dynamic range.
-    Returns (label, confidence) where confidence is 0.0-1.0.
-
-    If percentiles are provided, thresholds are relative to the track.
-    Otherwise falls back to absolute thresholds (less accurate).
+    Section labeling using stem energy, energy trajectory, and relative thresholds.
+    rms_delta: dB change vs previous section (positive = rising).
+    rms_trend: dB change over a longer window (3 sections), positive = sustained rise.
     """
-    # Position-based labels (high confidence at extremes)
-    if position_ratio < 0.03:
-        return "intro", 0.9
-    if position_ratio > 0.95:
-        return "outro", 0.9
+    p = track_rms_percentiles or {}
+    rms_p25, rms_p50, rms_p75 = p.get("p25", -24), p.get("p50", -18), p.get("p75", -12)
+    rms_range = max(rms_p75 - rms_p25, 1e-6)
+    energy_norm = (rms_dbfs - rms_p25) / rms_range
 
-    # Use relative thresholds if available, else absolute fallbacks
-    if track_rms_percentiles:
-        is_high_energy = rms_dbfs >= track_rms_percentiles.get("p75", -12)
-        is_low_energy = rms_dbfs <= track_rms_percentiles.get("p25", -24)
-        energy_extremity = abs(rms_dbfs - track_rms_percentiles.get("p50", -18)) / max(
-            track_rms_percentiles.get("p75", -12) - track_rms_percentiles.get("p25", -24), 1e-6
-        )
-    else:
-        is_high_energy = rms_dbfs > -12
-        is_low_energy = rms_dbfs < -24
-        energy_extremity = 0.5
+    # Stem signals -- only use a stem if it has meaningful dynamic range (>8dB)
+    se = stem_energies or {}
+    sp = stem_percentiles or {}
+    MIN_STEM_RANGE = 8.0
 
-    if track_onset_percentiles:
-        is_dense = onset_density >= track_onset_percentiles.get("p75", 0.5)
-    else:
-        is_dense = onset_density > 0.5
+    def stem_norm(name):
+        val = se.get(name, -96)
+        sp_data = sp.get(name, {})
+        s_p25 = sp_data.get("p25", -40)
+        s_p75 = sp_data.get("p75", -10)
+        s_range = s_p75 - s_p25
+        if s_range < MIN_STEM_RANGE:
+            return None  # stem has no meaningful variation
+        return (val - s_p25) / s_range
 
-    if track_hf_percentiles:
-        is_percussive = hf_perc_ratio >= track_hf_percentiles.get("p75", 0.04)
-    else:
-        is_percussive = hf_perc_ratio > 0.04
+    drums_n = stem_norm("drums")
+    bass_n = stem_norm("bass")
+    vocals_n = stem_norm("vocals")
+    other_n = stem_norm("other")
 
-    # Score each label candidate
+    has_vocals = vocals_n is not None and vocals_n > 0.4
+    has_strong_vocals = vocals_n is not None and vocals_n > 0.7
+    has_drums = drums_n is not None and drums_n > 0.3
+    has_strong_drums = drums_n is not None and drums_n > 0.7
+    has_bass = bass_n is not None and bass_n > 0.3
+    has_strong_bass = bass_n is not None and bass_n > 0.7
+    no_drums = drums_n is not None and drums_n < 0.15
+    no_bass = bass_n is not None and bass_n < 0.15
+
+    # Trajectory
+    is_rising = rms_delta > 1.0
+    is_falling = rms_delta < -1.0
+    trend_rising = rms_trend > 2.0
+    trend_falling = rms_trend < -2.0
+
     scores = {}
 
-    # Drop: high energy + dense + percussive
-    drop_score = (0.4 * float(is_high_energy) + 0.3 * float(is_dense) + 0.3 * float(is_percussive))
-    if is_high_energy and is_dense and is_percussive:
-        drop_score = min(1.0, drop_score + 0.3)
-    scores["drop"] = drop_score
+    # --- DROP: high energy, strong drums + bass ---
+    drop_s = 0.0
+    if energy_norm > 0.5:
+        drop_s += 0.2
+    if energy_norm > 0.8:
+        drop_s += 0.2
+    if has_strong_drums:
+        drop_s += 0.15
+    elif has_drums:
+        drop_s += 0.08
+    if has_strong_bass:
+        drop_s += 0.15
+    elif has_bass:
+        drop_s += 0.08
+    if not is_rising and not is_falling and energy_norm > 0.5:
+        drop_s += 0.1  # stable high = sustained drop
+    if has_strong_vocals:
+        drop_s -= 0.1  # vocals in drop less common in EDM
+    scores["drop"] = max(0, drop_s)
 
-    # Breakdown: low energy, not dense, mid-to-late position
-    bd_score = (0.4 * float(is_low_energy) + 0.3 * float(not is_dense) + 0.3 * float(position_ratio > 0.3))
-    scores["breakdown"] = bd_score
+    # --- BREAKDOWN: stripped arrangement, energy drop-off ---
+    # Key: breakdowns require BOTH low energy AND stripped arrangement (no drums)
+    # Moderate energy with drums = NOT a breakdown (probably verse or buildup)
+    bd_s = 0.0
+    if energy_norm < 0.25:
+        bd_s += 0.25
+    elif energy_norm < 0.4:
+        bd_s += 0.1
+    if no_drums:
+        bd_s += 0.25
+    elif drums_n is not None and drums_n < 0.2:
+        bd_s += 0.1
+    if no_bass:
+        bd_s += 0.1
+    if is_falling or trend_falling:
+        bd_s += 0.1
+    # Penalize breakdown when arrangement isn't actually stripped
+    if has_drums and energy_norm > 0.3:
+        bd_s -= 0.15
+    if has_vocals:
+        bd_s -= 0.2  # vocals present = much more likely verse
+    if has_strong_vocals:
+        bd_s -= 0.15  # strong vocals = definitely not breakdown
+    scores["breakdown"] = max(0, bd_s)
 
-    # Buildup: rising energy, moderate density, not the highest energy
-    bu_score = 0.3 * float(not is_low_energy and not is_high_energy) + 0.3 * float(is_dense) + 0.2 * float(not is_percussive)
-    if position_ratio > 0.1 and not is_high_energy and is_dense:
-        bu_score += 0.2
-    scores["buildup"] = bu_score
+    # --- BUILDUP: sustained rising energy ---
+    bu_s = 0.0
+    if is_rising:
+        bu_s += 0.2
+    if trend_rising:
+        bu_s += 0.25  # sustained rise is the strongest buildup signal
+    if 0.15 < energy_norm < 0.85:
+        bu_s += 0.1
+    if has_drums and not has_strong_drums:
+        bu_s += 0.1
+    if energy_norm > 0.85:
+        bu_s -= 0.15  # if already at peak, probably drop not buildup
+    scores["buildup"] = max(0, bu_s)
 
-    # Verse: moderate energy, moderate density
-    verse_score = 0.3 * float(not is_high_energy and not is_low_energy) + 0.2 * float(not is_dense)
-    if position_ratio < 0.4:
-        verse_score += 0.15
-    scores["verse"] = verse_score
+    # --- VERSE: vocals present, moderate energy ---
+    # Verse is primarily defined by vocal presence. Without vocals, verse is unlikely.
+    verse_s = 0.0
+    if has_vocals:
+        verse_s += 0.3
+    if has_strong_vocals:
+        verse_s += 0.2
+    if 0.1 < energy_norm < 0.7:
+        verse_s += 0.1
+    if not has_strong_drums:
+        verse_s += 0.05
+    # Without meaningful vocal stem data, verse score stays very low
+    scores["verse"] = max(0, verse_s)
 
-    # Intro: low-moderate energy near the start
-    intro_score = 0.5 * max(0, 0.15 - position_ratio) / 0.15 + 0.3 * float(is_low_energy)
-    scores["intro"] = intro_score
+    # --- INTRO: early in the track ---
+    # For EDM, the first ~15% is often intro/mix-in regardless of energy
+    intro_s = 0.0
+    if position_ratio < 0.15:
+        intro_s += 0.3 * max(0, (0.15 - position_ratio) / 0.15)
+    if energy_norm < 0.4 and position_ratio < 0.15:
+        intro_s += 0.2
+    elif position_ratio < 0.08:
+        intro_s += 0.15  # very start gets intro boost even at high energy
+    if no_drums and position_ratio < 0.15:
+        intro_s += 0.1
+    scores["intro"] = max(0, intro_s)
 
-    # Outro: low-moderate energy near the end
-    outro_score = 0.5 * max(0, position_ratio - 0.85) / 0.15 + 0.3 * float(is_low_energy)
-    scores["outro"] = outro_score
+    # --- OUTRO: final portion of track ---
+    # Outro detection must balance: EDM mix-outs are full-energy drops at the end.
+    # But legitimate drops also happen at 55-75% position. We use:
+    # - Strong position signal for the very end (>85%)
+    # - Energy decline + position for the 70-85% range
+    # - Position alone is NOT enough to override a clear drop at 60-75%
+    outro_s = 0.0
+    if position_ratio > 0.85:
+        outro_s += 0.4
+    elif position_ratio > 0.7:
+        pos_weight = (position_ratio - 0.7) / 0.15
+        outro_s += 0.15 * pos_weight
+    if position_ratio > 0.92:
+        outro_s += 0.2
+    # Declining energy in the tail is the strongest signal
+    if trend_falling and position_ratio > 0.6:
+        outro_s += 0.2
+    if is_falling and position_ratio > 0.7:
+        outro_s += 0.15
+    if energy_norm < 0.3 and position_ratio > 0.7:
+        outro_s += 0.15
+    scores["outro"] = max(0, outro_s)
 
     best_label = max(scores, key=scores.get)
     best_score = scores[best_label]
     sorted_scores = sorted(scores.values(), reverse=True)
     margin = sorted_scores[0] - sorted_scores[1] if len(sorted_scores) > 1 else sorted_scores[0]
-
-    # Confidence based on how clearly the top label wins
-    confidence = min(1.0, max(0.1, margin * 2 + best_score * 0.3))
+    confidence = min(1.0, max(0.1, margin * 1.5 + best_score * 0.4))
 
     return best_label, round(confidence, 2)
+
+
+def classify_section_label(
+    energy_norm: float,
+    position_ratio: float,
+    drums_n: float,
+    bass_n: float,
+    vocals_n: float,
+    other_n: float,
+    rms_delta: float,
+    rms_trend: float,
+    future_delta: float,
+    crest_db: float,
+    hf_perc_ratio: float,
+    flatness: float,
+) -> tuple[str, float]:
+    """Use trained classifier for section labeling. Falls back to rule-based if no model."""
+    if _CLASSIFIER is None:
+        return "unknown", 0.0
+
+    feature_vec = np.array([[
+        energy_norm,
+        position_ratio,
+        drums_n,
+        bass_n,
+        vocals_n,
+        other_n,
+        rms_delta,
+        rms_trend,
+        future_delta,
+        crest_db,
+        hf_perc_ratio,
+        flatness,
+        1.0 if drums_n > 0.7 else 0.0,
+        1.0 if bass_n > 0.7 else 0.0,
+        1.0 if vocals_n > 0.4 else 0.0,
+        1.0 if drums_n < 0.15 else 0.0,
+        position_ratio * energy_norm,
+    ]])
+
+    label = _CLASSIFIER.predict(feature_vec)[0]
+    proba = _CLASSIFIER.predict_proba(feature_vec)[0]
+    confidence = float(max(proba))
+    return str(label), round(confidence, 2)

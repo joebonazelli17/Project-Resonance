@@ -90,9 +90,11 @@ def run_analysis(track_id: str) -> None:
             from app.engine.spectral import (
                 compute_band_energies, compute_energy_curve,
                 compute_stereo_features, detect_section_label,
+                classify_section_label,
                 compute_eq_profiles,
                 compute_band_crest_and_transient_density,
                 detect_mastering_state,
+                compute_stem_energies,
             )
             import librosa as _lr
 
@@ -170,8 +172,9 @@ def run_analysis(track_id: str) -> None:
                         continue
                     raw_segments.append((seg, s, e, b0, b1, bars, s_i, e_i))
 
-            # Pass 1: percentiles
+            # Pass 1: percentiles (mix + stems)
             all_rms, all_onset, all_hf, pre_feats = [], [], [], []
+            all_stem_energies = []
             for (seg, s, e, b0, b1, bars, s_i, e_i) in raw_segments:
                 feats = _extra_features(seg, sr)
                 onset_env = _lr.onset.onset_strength(y=seg, sr=sr)
@@ -180,10 +183,20 @@ def run_analysis(track_id: str) -> None:
                 all_onset.append(onset_d)
                 all_hf.append(feats["hf_perc_ratio"])
                 pre_feats.append((feats, onset_d))
+                # Per-stem energy for this section
+                se = compute_stem_energies(stems, sr, s_i, e_i) if stems else {}
+                all_stem_energies.append(se)
 
             rms_pct = _compute_percentiles(all_rms)
             onset_pct = _compute_percentiles(all_onset)
             hf_pct = _compute_percentiles(all_hf)
+
+            # Stem percentiles (track-wide)
+            stem_pct = {}
+            for sname in STEM_NAMES:
+                vals = [se.get(sname, -96) for se in all_stem_energies if se.get(sname, -96) > -90]
+                if vals:
+                    stem_pct[sname] = _compute_percentiles(vals)
 
             # Pass 2: full features
             seg_meta = []
@@ -192,6 +205,8 @@ def run_analysis(track_id: str) -> None:
             sr_48k = 48000
             y_48k = _resample_to_48k(y, sr)
 
+            # Collect all features first (labeling deferred for trajectory)
+            seg_features = []
             for idx, (seg, s, e, b0, b1, bars, s_i, e_i) in enumerate(raw_segments):
                 feats, onset_d = pre_feats[idx]
                 band_cr, band_td = compute_band_crest_and_transient_density(seg, sr)
@@ -204,28 +219,100 @@ def run_analysis(track_id: str) -> None:
                     if st_seg.shape[1] >= sr:
                         stereo_f = compute_stereo_features(st_seg, sr)
 
-                pos_ratio = float(s) / max(duration_s, 1e-6)
-                label, confidence = detect_section_label(
-                    rms_dbfs=feats["rms_dbfs"], onset_density=onset_d,
-                    hf_perc_ratio=feats["hf_perc_ratio"], flatness=feats["flatness"],
-                    position_ratio=pos_ratio, bpm=bpm,
-                    track_rms_percentiles=rms_pct, track_onset_percentiles=onset_pct,
-                    track_hf_percentiles=hf_pct,
-                )
-
-                seg_meta.append({
+                seg_features.append({
                     "start_s": s, "end_s": e, "bars": bars,
                     "bar_start": b0, "bar_end": b1,
                     "bpm": bpm, "key": key, "scale": scale,
-                    "section_label": label, "section_label_confidence": confidence,
                     "band_energies": band_e, "stereo_features": stereo_f,
                     "band_crest": band_cr, "band_transient_density": band_td,
                     "_eq_profile": eq_avg, "_eq_profile_peak": eq_peak, "_eq_profile_variance": eq_var,
+                    "stem_energies": all_stem_energies[idx] if all_stem_energies else None,
                     **feats,
                 })
 
-                s_48 = int(round(s * sr_48k))
-                e_48 = int(round(e * sr_48k))
+            # Group features by bar size for trajectory computation
+            by_bars = {}
+            for idx, sf in enumerate(seg_features):
+                by_bars.setdefault(sf["bars"], []).append(idx)
+
+            MIN_STEM_RANGE = 8.0
+
+            def _stem_norm(val, sp_data):
+                s_p25 = sp_data.get("p25", -40)
+                s_p75 = sp_data.get("p75", -10)
+                s_range = s_p75 - s_p25
+                if s_range < MIN_STEM_RANGE:
+                    return -1.0
+                return (val - s_p25) / s_range
+
+            # Label with classifier + trajectory per bar-size group
+            for bars_key, indices in by_bars.items():
+                rms_list = [pre_feats[i][0]["rms_dbfs"] for i in indices]
+
+                for pos, idx in enumerate(indices):
+                    sf = seg_features[idx]
+                    feats, onset_d = pre_feats[idx]
+                    cur_rms = feats["rms_dbfs"]
+
+                    rms_delta = (cur_rms - rms_list[pos - 1]) if pos >= 1 else 0.0
+                    if pos >= 3:
+                        rms_trend = (cur_rms - rms_list[pos - 3]) / 3.0
+                    elif pos >= 1:
+                        rms_trend = rms_delta
+                    else:
+                        rms_trend = 0.0
+
+                    next1 = rms_list[pos + 1] if pos + 1 < len(rms_list) else cur_rms
+                    next2 = rms_list[pos + 2] if pos + 2 < len(rms_list) else cur_rms
+                    future_delta = (next2 - cur_rms) / 2.0
+
+                    # Compute stem norms
+                    se = all_stem_energies[idx] if all_stem_energies else {}
+                    drums_n = _stem_norm(se.get("drums", -96), stem_pct.get("drums", {}))
+                    bass_n = _stem_norm(se.get("bass", -96), stem_pct.get("bass", {}))
+                    vocals_n = _stem_norm(se.get("vocals", -96), stem_pct.get("vocals", {}))
+                    other_n = _stem_norm(se.get("other", -96), stem_pct.get("other", {}))
+
+                    energy_norm = (cur_rms - rms_pct.get("p25", -24)) / max(
+                        rms_pct.get("p75", -12) - rms_pct.get("p25", -24), 1e-6)
+                    pos_ratio = float(sf["start_s"]) / max(duration_s, 1e-6)
+
+                    # Try classifier first, fall back to rules
+                    label, confidence = classify_section_label(
+                        energy_norm=energy_norm,
+                        position_ratio=pos_ratio,
+                        drums_n=drums_n,
+                        bass_n=bass_n,
+                        vocals_n=vocals_n,
+                        other_n=other_n,
+                        rms_delta=rms_delta,
+                        rms_trend=rms_trend,
+                        future_delta=future_delta,
+                        crest_db=feats["crest_db"],
+                        hf_perc_ratio=feats["hf_perc_ratio"],
+                        flatness=feats["flatness"],
+                    )
+                    if label == "unknown":
+                        label, confidence = detect_section_label(
+                            rms_dbfs=cur_rms, onset_density=onset_d,
+                            hf_perc_ratio=feats["hf_perc_ratio"], flatness=feats["flatness"],
+                            position_ratio=pos_ratio, bpm=bpm,
+                            track_rms_percentiles=rms_pct, track_onset_percentiles=onset_pct,
+                            track_hf_percentiles=hf_pct,
+                            stem_energies=se, stem_percentiles=stem_pct,
+                            rms_delta=rms_delta, rms_trend=rms_trend,
+                        )
+
+                    sf["section_label"] = label
+                    sf["section_label_confidence"] = confidence
+
+            for sf in seg_features:
+                seg_meta.append(sf)
+
+            # Build CLAP segments from pre-resampled audio
+            for idx, sf in enumerate(seg_meta):
+                s_48 = int(round(sf["start_s"] * sr_48k))
+                e_48 = int(round(sf["end_s"] * sr_48k))
                 mix_seg_48 = y_48k[s_48:e_48]
                 if mix_seg_48.shape[0] >= sr_48k:
                     mix_clap_segments.append(mix_seg_48)

@@ -81,6 +81,7 @@ class TrackSection(Base):
     stereo_features: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     band_crest: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     band_transient_density: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    stem_energies: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     eq_profile: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     eq_profile_peak: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
