@@ -57,6 +57,31 @@ services:
       - ./backend:/app
       - models:/models
 
+  worker:
+    platform: linux/amd64
+    image: project-resonance-backend
+    depends_on:
+      db:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    environment:
+      DATABASE_URL: postgresql+asyncpg://resonance:resonance@db:5432/resonance
+      S3_ENDPOINT: http://minio:9000
+      S3_PUBLIC_ENDPOINT: http://127.0.0.1:9002
+      S3_ACCESS_KEY: minioadmin
+      S3_SECRET_KEY: minioadmin
+      S3_BUCKET_TRACKS: resonance-tracks
+      CLAP_DEVICE: cpu
+      OMP_NUM_THREADS: "6"
+      MKL_NUM_THREADS: "6"
+      VECLIB_MAXIMUM_THREADS: "6"
+      TORCH_NUM_THREADS: "6"
+    volumes:
+      - ./backend:/app
+      - models:/models
+    command: python -u -c "import app.core.patches; from app.workers.analyze import run_worker; run_worker()"
+
   frontend:
     build: ./frontend
     depends_on:

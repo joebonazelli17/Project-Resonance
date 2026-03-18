@@ -51,6 +51,16 @@ def download_to_path(key: str, dest: Path, bucket: str | None = None) -> Path:
     return dest
 
 
+def file_exists(key: str, bucket: str | None = None) -> bool:
+    bucket = bucket or settings.S3_BUCKET_TRACKS
+    client = _get_client()
+    try:
+        client.head_object(Bucket=bucket, Key=key)
+        return True
+    except Exception:
+        return False
+
+
 def delete_file(key: str, bucket: str | None = None) -> None:
     bucket = bucket or settings.S3_BUCKET_TRACKS
     client = _get_client()

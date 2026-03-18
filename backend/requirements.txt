@@ -31,5 +31,8 @@ torchvision
 # Stem separation
 demucs==4.0.1
 
+# ML classifier
+scikit-learn>=1.3.0
+
 # Misc
 httpx==0.28.1

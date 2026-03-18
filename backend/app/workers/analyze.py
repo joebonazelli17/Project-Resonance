@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import app.core.patches  # noqa: F401 -- must be early to patch HF before ML imports
 
+import io
 import tempfile
 import uuid
 from pathlib import Path
@@ -12,7 +13,7 @@ from sqlalchemy.orm import selectinload
 
 from app.core.config import settings
 from app.core.database import SyncSession, async_session
-from app.core.storage import download_to_path
+from app.core.storage import download_to_path, upload_file, download_file, file_exists
 from app.models.track import Track, TrackSection, TrackStatus
 
 STEM_NAMES = ("drums", "bass", "vocals", "other")
@@ -54,13 +55,67 @@ def _compute_percentiles(values: list[float]) -> dict:
 def spawn_analysis(track_id: str) -> None:
     """Spawn analysis in a separate process so the API stays responsive."""
     import subprocess, sys
+    log_path = f"/tmp/analyze_{track_id}.log"
+    log_file = open(log_path, "w")
     subprocess.Popen(
-        [sys.executable, "-c",
+        [sys.executable, "-u", "-c",
          f"import app.core.patches; from app.workers.analyze import run_analysis; run_analysis('{track_id}')"],
         cwd="/app",
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
     )
+    print(f"[spawn] Analysis started for {track_id}, log: {log_path}", flush=True)
+
+
+def run_worker(poll_interval: float = 3.0) -> None:
+    """Persistent worker: polls DB for PENDING tracks, processes in-process.
+    Models stay loaded between tracks -- eliminates cold-start penalty."""
+    import time as _time
+
+    print("[worker] Starting persistent analysis worker...", flush=True)
+    print("[worker] Pre-loading models...", flush=True)
+
+    # Pre-load all heavy models once
+    t0 = _time.monotonic()
+    from app.engine.embeddings import embed_audio_batch  # loads CLAP
+    from app.engine.stems import separate_stems  # loads Demucs
+    from app.engine.tempo_bars import detect_beats_bpm_key  # loads Essentia
+    from app.engine.spectral import classify_section_label, _CLASSIFIER
+    print(f"[worker] Models loaded in {_time.monotonic()-t0:.1f}s", flush=True)
+    print(f"[worker] Classifier: {'loaded' if _CLASSIFIER else 'NOT loaded'}", flush=True)
+    print(f"[worker] Polling every {poll_interval}s for PENDING tracks...", flush=True)
+
+    while True:
+        try:
+            with SyncSession() as db:
+                result = db.execute(
+                    select(Track)
+                    .where(Track.status.in_([TrackStatus.PENDING]))
+                    .order_by(Track.created_at)
+                    .limit(1)
+                )
+                track = result.scalar_one_or_none()
+                if track:
+                    track_id = str(track.id)
+                    filename = track.original_filename
+                    # Claim it immediately so subprocess spawns don't race
+                    track.status = TrackStatus.ANALYZING
+                    db.commit()
+                    print(f"[worker] Claimed PENDING track: {filename} ({track_id})", flush=True)
+
+            if track:
+                try:
+                    run_analysis(track_id)
+                except Exception as exc:
+                    print(f"[worker] Analysis failed for {track_id}: {exc}", flush=True)
+            else:
+                _time.sleep(poll_interval)
+        except KeyboardInterrupt:
+            print("[worker] Shutting down.", flush=True)
+            break
+        except Exception as exc:
+            print(f"[worker] Error: {exc}", flush=True)
+            _time.sleep(poll_interval)
 
 
 def run_analysis(track_id: str) -> None:
@@ -115,17 +170,31 @@ def run_analysis(track_id: str) -> None:
                 pass
             print(f"[analyze] load+mastering: {_time.monotonic()-t1:.1f}s", flush=True)
 
-            # --- Step 2: Parallel - Demucs + Beat detection ---
+            # --- Step 2: Parallel - Demucs (cached) + Beat detection ---
             t2 = _time.monotonic()
             stems = {}
             beats_result = [None]
+            stems_cache_key = f"stems/{track_id}.npz"
 
             def _run_demucs():
                 nonlocal stems
                 try:
+                    # Check for cached stems in MinIO
+                    if file_exists(stems_cache_key):
+                        cached = np.load(io.BytesIO(download_file(stems_cache_key)))
+                        stems = {name: cached[name] for name in STEM_NAMES if name in cached}
+                        print(f"[analyze] Demucs CACHED: {_time.monotonic()-t2:.1f}s ({list(stems.keys())})", flush=True)
+                        return
+
                     from app.engine.stems import separate_stems
                     stems = separate_stems(y, sr)
                     print(f"[analyze] Demucs: {_time.monotonic()-t2:.1f}s", flush=True)
+
+                    # Cache stems to MinIO for future reanalysis
+                    buf = io.BytesIO()
+                    np.savez_compressed(buf, **stems)
+                    upload_file(buf.getvalue(), stems_cache_key, content_type="application/octet-stream")
+                    print(f"[analyze] Stems cached to {stems_cache_key}", flush=True)
                 except Exception as ex:
                     print(f"[analyze] Demucs failed: {ex}", flush=True)
 

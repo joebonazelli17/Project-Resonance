@@ -112,16 +112,19 @@ def _best_bar_grid(
 
     for bpb in time_sig_candidates:
         sec_per_bar = sec_per_beat * bpb
-        # try all possible downbeat phases 0..bpb-1
         for phase in range(bpb):
             bars_bound = beats[phase::bpb]
             if bars_bound.size < 2:
                 continue
             durs = np.diff(bars_bound)
-            # score: closeness to sec_per_bar and temporal stability
             mean_err = float(np.abs(np.median(durs) - sec_per_bar))
             var = float(np.var(durs)) if durs.size > 1 else 0.0
-            score = mean_err + 0.5 * var  # weight variance a bit
+            score = mean_err + 0.5 * var
+            # Strong 4/4 prior: non-4/4 must be substantially better to win.
+            # With evenly-spaced beats, all groupings score ~0, so without
+            # this bias the first candidate in the list wins arbitrarily.
+            if bpb != 4:
+                score += 0.1
             cand = (score, bpb, phase, sec_per_bar)
             if (best is None) or (score < best[0]):
                 best = cand
