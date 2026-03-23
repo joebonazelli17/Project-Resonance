@@ -54,6 +54,7 @@ Existing tools (Mastering The Mix REFERENCE, iZotope Audiolens) do static A/B co
 - **Demucs** (htdemucs) for stem separation (drums/bass/vocals/other)
 - **FAISS** (flat inner-product) for vector similarity search
 - **librosa** for spectral analysis, onset detection, mel features
+- **scikit-learn RandomForest** for section classification
 
 ### Frontend (`frontend/`)
 - **Next.js 15** + React 19 + TypeScript
@@ -62,7 +63,7 @@ Existing tools (Mastering The Mix REFERENCE, iZotope Audiolens) do static A/B co
 - **lucide-react** for icons
 
 ### Infrastructure
-- **docker-compose.yml** orchestrates 4 services: Postgres 16, MinIO, FastAPI backend, Next.js frontend
+- **docker-compose.yml** orchestrates 5 services: Postgres 16, MinIO, FastAPI backend, persistent worker, Next.js frontend
 - **Backend forced to `linux/amd64`** in docker-compose for cross-platform compatibility (essentia has no Linux aarch64 wheels; QEMU emulation on M1 Mac, native on Windows)
 - **Dockerfiles** for both backend and frontend (standalone Next.js output)
 
@@ -95,32 +96,35 @@ Existing tools (Mastering The Mix REFERENCE, iZotope Audiolens) do static A/B co
 ## Analysis Pipeline
 
 1. File stored in S3 (MinIO), track record created (status=pending)
-2. Background worker:
+2. Persistent worker polls for pending tracks with models preloaded once per process (upload route still has subprocess fallback if worker is unavailable)
+3. Background analysis:
    a. Download from S3
    b. **Mastering state detection on raw audio** (crest factor, peak level, loudness histogram) -- before normalization
    c. Load mono float32 at 44.1kHz, peak-normalize to 0.95
-   d. Essentia beat tracking -> BPM, key, scale, time signature, downbeat phase
+   d. Essentia beat tracking -> BPM, key, scale, time signature, downbeat phase (with strong 4/4 prior for EDM)
    e. Track-level energy curve (LUFS/centroid/onset/low-ratio over time)
-   f. Demucs stem separation -> drums, bass, vocals, other
+   f. Demucs stem separation -> drums, bass, vocals, other (cached to MinIO for future reanalysis)
    g. Stereo load for stereo analysis (if stereo source)
-   h. **Two-pass section analysis** for each bar size (2, 4, 8, 16):
-      - Pass 1: Collect all segments, compute per-segment features, build percentile distributions (p25/p50/p75 for RMS, onset density, HF ratio)
-      - Pass 2: Compute all features with relative thresholds using track percentiles:
-        - Core features: hf_perc_ratio, rms_dbfs, peak_dbfs, crest_db, flatness
-        - 64-band mel profiles: average, peak, variance (for search ranking)
-        - 8-band spectral energy (for UI), per-band crest, per-band transient density
-        - Stereo features (if stereo source)
-        - Section label using relative thresholds + confidence scoring
-        - Stem window slicing for per-stem embeddings
-   i. **Phase 1**: Batch CLAP embedding of mix segments only -> mark track as READY
-   j. Store core features + mix embeddings to Postgres
-   k. **Phase 2**: Batch CLAP embedding of stem segments (runs after track is already usable)
-   l. Update existing sections with stem embeddings
+   h. **Batch section analysis** for each bar size (2, 4, 8, 16):
+      - Build all windows first using beat grid / fallback bar slicing
+      - Compute full-track STFT/HPSS + onset envelope once, then slice per segment
+      - Extract core features: hf_perc_ratio, rms_dbfs, peak_dbfs, crest_db, flatness
+      - Compute 64-band mel profiles: average, peak, variance (for search ranking)
+      - Compute 8-band spectral energy (for UI), per-band crest, per-band transient density
+      - Compute stereo features (if stereo source)
+      - Compute per-stem section energies
+      - Label sections with RandomForest classifier + rule-based fallback
+   i. **Phase 1**: Persist core analysis and section metadata, then mark track as READY
+   j. **Phase 2**: Batch CLAP embeddings for mix + stems after the track is already usable
+   k. Update existing sections with embeddings as they finish
 
 ## API Endpoints
 
 ### Tracks
-- `POST /api/tracks/upload` -- Upload audio file, spawns analysis in separate subprocess (API stays responsive)
+- `POST /api/tracks/upload` -- Upload audio file; persistent worker picks up the job, with subprocess fallback so the API stays responsive
+- `POST /api/tracks/{id}/reanalyze` -- Delete existing sections and rerun full analysis
+- `POST /api/tracks/{id}/relabel` -- Re-run section classifier only (no audio reprocessing)
+- `POST /api/tracks/relabel-all` -- Re-run section classifier for all ready tracks
 - `GET /api/tracks` -- List tracks (filterable by status)
 - `GET /api/tracks/{id}` -- Track detail with all sections
 - `GET /api/tracks/{id}/energy` -- Energy curve data
@@ -132,6 +136,7 @@ Existing tools (Mastering The Mix REFERENCE, iZotope Audiolens) do static A/B co
 - `POST /api/search` -- Upload query audio, find similar sections (blended CLAP + EQ scoring). Temporary query track is cleaned up after search completes.
 - `GET /api/search/text` -- Natural language search via CLAP text encoder
 - `POST /api/search/stems` -- Weighted per-stem similarity search
+- `GET /api/search/reference-coach/{track_id}` -- Build an anchor-track view for an analyzed track using same-label section matches
 - `GET /api/search/compare/{a}/{b}` -- Smart section comparison with mastering-aware recommendations
 - `GET /api/search/library/stats` -- Library statistics (track count, bars distribution, mastering distribution)
 
@@ -141,7 +146,9 @@ Blended multi-signal scoring:
 - `score = 0.7 * clap_cosine_sim + 0.3 * eq_profile_cosine_sim`
 - HF percussive ratio hard gate (reject spectrally incompatible matches)
 - DAE hybrid embeddings as optional mode (CLAP + engineered features)
-- Compare endpoint: spectral shape delta relative to 1kHz anchor, distinguishes arrangement differences (transient density) from tonal differences (EQ-fixable), mastering-aware recommendations with severity levels
+- Reference Coach aggregates best section matches into a single **anchor track** using similarity + coverage across the uploaded track
+- Reference Coach prefers **same-label matches** when section labels are available, falling back gracefully when they are not
+- Compare endpoint: spectral shape delta relative to 1kHz anchor, distinguishes arrangement differences (transient density) from tonal differences (EQ-fixable), adds stem-balance deltas, and emits mastering-aware recommendations with severity levels
 
 ## Docker & Infrastructure Notes
 
@@ -150,7 +157,9 @@ Blended multi-signal scoring:
 - Dockerfile downloads CLAP (~600MB), RoBERTa (~500MB), BERT vocab, Demucs (~80MB) at build time
 - Essentia pinned to `2.1b6.dev1389` (Jul 2025 release with prebuilt x86_64 manylinux wheels)
 - `app.core.patches` module monkey-patches HuggingFace `from_pretrained` to load from `/models/` (imported by both main.py and standalone workers)
-- Analysis runs in separate subprocess via `spawn_analysis()` -- API stays responsive, models cold-load per track (persistent worker planned)
+- Persistent worker preloads heavy models once, polls every few seconds for `PENDING` tracks, and reuses models across analyses
+- `spawn_analysis()` still exists as a fallback path so the API stays responsive if the worker is not running
+- Stem separations are cached in MinIO as `.npz` blobs to accelerate reanalysis
 - Background worker uses sync psycopg2 (not async asyncpg) to avoid event loop conflicts
 - `./backend:/app` volume mount with `--reload` -- code changes picked up live (note: auto-reload kills in-flight analysis)
 - **Zscaler**: EY corporate proxy blocks huggingface.co. First build must be on unrestricted network (home Mac). Then `docker save` the image and transfer to work PC.
@@ -162,16 +171,19 @@ Blended multi-signal scoring:
 - Essentia beat/BPM/key/time-sig detection (gold standard, no fallbacks)
 - Demucs stem separation (drums/bass/vocals/other)
 - CLAP audio + text embeddings (512-dim, L2-normalized)
+- ML section classifier trained from hand-labeled ground truth tracks, with relabel-only endpoints for fast iteration
+- 4/4 bar-grid fix for EDM tracks (prevents inflated bar counts from incorrect 3/4 detection)
 - Deep spectral analysis: 64-band mel profiles (avg/peak/variance), 8-band energy/crest/transient density
 - Mastering state detection (runs on raw audio before normalization)
-- Two-pass section labeling with relative thresholds and confidence scores
+- Section labeling with confidence scores, stem energies, trajectory features, and rule-based fallback
 - Blended search scoring (CLAP + EQ profile cosine + HF gating)
-- Smart comparison endpoint with mastering-aware, arrangement-vs-EQ-aware recommendations
+- Smart comparison endpoint with mastering-aware, arrangement-vs-EQ-aware recommendations plus stem-balance deltas
 - Stereo width analysis (correlation, mid/side ratio, per-band width)
 - Track energy curves (LUFS, centroid, onset density, low ratio over time)
 - Text search and weighted stem search via CLAP shared embedding space
 - Waveform player with section regions, click-to-seek overlay, section card seeking
 - Track detail page with section cards, bars/label filters, spectral profile visualization
+- **Reference Coach** on the track detail page: anchor track summary, per-section best match, alternate matches, and actionable guidance
 - Dynamic waveform regions: update when switching bar size or section type filters
 - Search page with text/stem/audio modes, stem weight sliders
 - Library page with drag-and-drop upload, status badges, elapsed timer, auto-refresh
@@ -179,17 +191,21 @@ Blended multi-signal scoring:
 - Delete confirmation dialogs on library and track detail pages
 
 ### Performance optimizations (latest)
-- **Two-phase analysis**: Phase 1 (core features + mix CLAP) marks track READY in ~7 min. Phase 2 (stem embeddings) runs after, updating existing sections. Track is usable immediately after Phase 1.
-- **Subprocess analysis**: `spawn_analysis()` runs in a separate Python process so the API stays fully responsive during analysis. No more frozen UI while tracks process.
+- **Two-phase analysis**: Phase 1 now stores core analysis only and marks the track READY before CLAP finishes. Mix + stem embeddings run entirely in Phase 2.
+- **Persistent worker**: Models load once and stay warm across tracks instead of cold-loading every job.
+- **Relabel-only workflow**: Section-classifier iteration now takes seconds instead of full audio reprocessing.
+- **Stem cache**: Demucs output is cached in MinIO and reused on reanalysis.
 - **Hop size 4**: Changed `DEFAULT_HOP_BARS` from 2 to 4, cutting segment count roughly in half (~260 segments for a 6-min track vs ~472).
 - **Thread count 6**: Changed `OMP_NUM_THREADS` / `MKL_NUM_THREADS` / `TORCH_NUM_THREADS` from 1 to 6 on a 6-core Ryzen.
 - **Parallel Demucs + beat detection**: ThreadPoolExecutor runs stem separation and beat/BPM/key detection concurrently
 - **Pre-resample to 48kHz**: Full track + stems resampled once upfront, then sliced per section (eliminates per-segment resample operations)
 - **Cached mel spectrograms**: `compute_eq_profiles()` computes avg/peak/variance from single mel spectrogram (was 3 separate spectrograms per section)
 - **Combined STFT**: `compute_band_crest_and_transient_density()` computes both from single STFT (was 2 per section)
+- **Batch feature extraction**: full-track STFT/HPSS + onset envelope are computed once and sliced per segment, cutting feature extraction roughly 3x on a 252-section track
+- **CLAP deferred from Phase 1**: section matching embeddings no longer block initial usability
 - **GPU auto-detection**: Startup logs platform, torch version, GPU availability, thread count
 - **Timing instrumentation**: Each pipeline step logs elapsed time for profiling
-- **Next improvement**: Persistent worker process (models load once, reused across tracks) to eliminate cold-start penalty
+- **Observed performance on current CPU setup**: ~2.3 min to READY for cached reanalysis, ~8.7 min to READY for a brand-new track; remaining first-pass floor is mostly Demucs CPU time
 
 ### Infrastructure fixes (latest)
 - **Next.js API proxy**: Frontend uses `rewrites()` in next.config.ts to proxy `/api/*` to backend. Eliminates CORS and IPv4/IPv6 issues. Upload goes directly to backend to bypass proxy body size limits.
@@ -219,25 +235,27 @@ Blended multi-signal scoring:
 - **Spectral profile A-weighted**: Raw band energies are perceptually weighted (A-weighting curve) and peak-normalized per section, so the display matches what you'd see on a spectrum analyzer. Without this, low frequencies always dominated due to physics.
 - **Section cards sorted**: Cards now sorted by start time (ascending), then by bar size.
 - **Waveform regions on "All" filter**: When no specific bar filter is selected, waveform regions use the largest available bar size to avoid overlap. Previously, mixing all bar sizes made most regions invisible.
-- **useMemo hook order fix**: Moved `bandMedians` computation before early returns to satisfy React's rules of hooks.
+- **Reference Coach auto-refresh**: Track page now refreshes coaching automatically while analysis / embeddings finish, instead of making the user manually reload.
 
 ### Completed milestones
 - Docker build on home Mac with `linux/amd64` (all models downloaded successfully)
 - First real track upload and end-to-end pipeline validation (328 sections, all stems, CLAP embeddings)
 - Docker image transfer to Windows work PC via `docker save` / `docker load`
-- All 4 services running on Windows (db, minio, backend, frontend)
+- All 5 services running on Windows (db, minio, backend, worker, frontend)
 - Waveform playback working with AIFF transcoding and click-to-seek
-- Analysis pipeline optimized (parallel steps, cached spectrograms, single CLAP batch)
-- 3 tracks loaded and analyzed: John Summit - Tears, Seven Lions - The Sirens, SØNIN - Passion
+- Analysis pipeline optimized (persistent worker, stem caching, batch features, deferred CLAP)
+- Ground-truth-labeled training set assembled and classifier retrained from real tracks
+- Reference Coach slice shipped on the analyzed-track page
 - Spectral profile visualization calibrated with A-weighting for perceptually accurate display
 
 ### Pending / next steps (prioritized)
-- **Ground truth calibration** (NEXT): User will manually annotate 5-10 tracks with correct section labels, BPM, and structure. Compare against tool output to tune section labeling thresholds and identify systematic errors. All analysis data is accessible via API for comparison.
-- **Persistent worker process**: Models load once and stay in memory, accepting jobs via queue. Eliminates cold-start penalty (~2 min model load per track). Currently each `spawn_analysis()` subprocess cold-loads all models.
-- Implement Anchor Track + Component Breakdown (see product vision below)
-- Validate search quality with real corpus (multiple tracks)
+- **Broaden labeled evaluation set**: current classifier is useful, but it still needs more hand-labeled tracks to prove generalization across more song structures
+- **Deepen the Reference Coach UX**: A/B auditioning, anchor-track review flow, and better “what should I do next?” sequencing
+- **Improve recommendation orchestration**: move from raw per-comparison tips to smarter section-level coaching summaries across the full song
+- **Tighten section-type gating across all search modes**: Reference Coach now uses same-label matching; the general search endpoints still need the same discipline
+- **Validate search quality with real corpus (multiple tracks)**
 - Controlled ground truth testing with modified stems (see testing strategy below)
-- Build Docker image natively on Windows (eliminate QEMU emulation)
+- Speed/infrastructure path for scale: GPU-backed analysis + bulk ingest queue for large libraries
 - Alembic migrations setup
 - Authentication layer
 
@@ -248,6 +266,8 @@ Evolving from track-level similarity to component-level similarity. Instead of "
 
 ### Anchor Track + Component Insights (critical UX model)
 Avoid "Frankenstein references" -- we do NOT recommend "use Track A drums, Track B bass, Track C vocals." This breaks musical cohesion.
+
+Status: **first implementation slice shipped**. The analyzed-track page now selects an anchor track, shows best per-section matches, alternates, and comparison guidance. The full product vision below is still the target state.
 
 **Step 1 -- Anchor Track (Primary Reference):**
 Select best overall match, gated by section type (drop matches drop, verse matches verse) and similar BPM/structure.
@@ -277,7 +297,11 @@ Closest drum matches:
 ```
 
 ### Section-type gating (required constraint)
-All similarity search must be gated by section label: drop matches drop, verse matches verse, build matches build. Otherwise results become misleading. Currently search matches by bar count but not section label -- this needs to be added.
+All similarity search must be gated by section label: drop matches drop, verse matches verse, build matches build. Otherwise results become misleading.
+
+Current state:
+- **Reference Coach** now prefers same-label section matches when labels are available
+- General search endpoints still mostly match by bar count / embeddings / HF gating and need stronger section-type constraints
 
 ### User-controlled stem weighting
 User can specify focus areas: "Drums + Bass focus", "Ignore vocals", "Everything except vocals." Already partially implemented in stem search -- needs to be integrated into the anchor track flow.
@@ -316,7 +340,7 @@ System should be directionally correct -- not necessarily perfectly precise (Dem
 ## Future Roadmap
 
 ### Tier 1: Core Differentiators
-- **Anchor Track + Component Breakdown**: The core product experience described above. New API endpoint and frontend view. All underlying data already exists.
+- **Expand Reference Coach into full Anchor Track + Component Breakdown**: richer anchor selection review, better component deltas, and cleaner section-by-section coaching workflow
 - **Phrase-by-phrase cross-reference matching**: Timeline UI showing your sections mapped to best-matching reference sections across the entire library
 - **Self-learning feedback loop**: User confirms/rejects matches, system tunes scoring weights per-genre over time
 - **A/B spectral diff visualization**: Side-by-side spectrograms with delta heat map overlay, arrangement vs EQ distinction

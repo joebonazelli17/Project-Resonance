@@ -342,20 +342,19 @@ def detect_section_label(
     rms_range = max(rms_p75 - rms_p25, 1e-6)
     energy_norm = (rms_dbfs - rms_p25) / rms_range
 
-    # Stem signals -- only use a stem if it has meaningful dynamic range (>8dB)
+    # Stem signals -- normalize using p5/p95 range for full dynamic picture
     se = stem_energies or {}
     sp = stem_percentiles or {}
-    MIN_STEM_RANGE = 8.0
 
     def stem_norm(name):
         val = se.get(name, -96)
         sp_data = sp.get(name, {})
-        s_p25 = sp_data.get("p25", -40)
-        s_p75 = sp_data.get("p75", -10)
-        s_range = s_p75 - s_p25
-        if s_range < MIN_STEM_RANGE:
-            return None  # stem has no meaningful variation
-        return (val - s_p25) / s_range
+        s_lo = sp_data.get("p5", -40)
+        s_hi = sp_data.get("p95", -10)
+        s_range = s_hi - s_lo
+        if s_range < 1.0:
+            return None  # stem is essentially constant
+        return (val - s_lo) / s_range
 
     drums_n = stem_norm("drums")
     bass_n = stem_norm("bass")

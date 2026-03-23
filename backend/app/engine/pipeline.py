@@ -173,6 +173,60 @@ def _extra_features(y: np.ndarray, sr: int) -> dict:
     }
 
 
+class BatchFeatureExtractor:
+    """Pre-compute full-track STFT/HPSS once, then extract per-segment features via slicing."""
+
+    def __init__(self, y: np.ndarray, sr: int, n_fft: int = 2048, hop_length: int = 512):
+        if y.ndim > 1:
+            y = y.mean(axis=0)
+        self.y = y.astype(np.float32, copy=False)
+        self.sr = sr
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+
+        # One STFT + HPSS for the entire track
+        S = librosa.stft(self.y, n_fft=n_fft, hop_length=hop_length)
+        self.H, self.P = librosa.decompose.hpss(S)
+        self.mag_H = np.abs(self.H)
+        self.mag_P = np.abs(self.P)
+        self.hf_band = int(self.mag_P.shape[0] * 0.8)
+
+        # Full-track spectral flatness frames
+        self.flatness_frames = librosa.feature.spectral_flatness(S=np.abs(S))[0]
+
+    def _sample_to_frame(self, sample_idx: int) -> int:
+        return sample_idx // self.hop_length
+
+    def extract(self, s_i: int, e_i: int) -> dict:
+        """Extract features for a segment defined by sample indices."""
+        seg = self.y[s_i:e_i]
+
+        # Slice pre-computed STFT frames
+        f_start = self._sample_to_frame(s_i)
+        f_end = self._sample_to_frame(e_i)
+        f_end = max(f_end, f_start + 1)
+
+        mag_P_seg = self.mag_P[:, f_start:f_end]
+        hf_perc_ratio = float(mag_P_seg[self.hf_band:, :].sum() / (mag_P_seg.sum() + 1e-8))
+
+        # RMS / peak from audio directly (cheap)
+        rms = float(np.sqrt(np.mean(seg ** 2)))
+        peak = float(np.max(np.abs(seg)))
+        crest = float(20 * np.log10((peak + 1e-6) / (rms + 1e-6)))
+
+        # Slice pre-computed flatness
+        flat_seg = self.flatness_frames[f_start:f_end]
+        flat = float(flat_seg.mean()) if flat_seg.size > 0 else 0.0
+
+        return {
+            "hf_perc_ratio": hf_perc_ratio,
+            "rms_dbfs": 20 * np.log10(rms + 1e-9),
+            "peak_dbfs": 20 * np.log10(peak + 1e-9),
+            "crest_db": crest,
+            "flatness": flat,
+        }
+
+
 def _cos(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-12))
 

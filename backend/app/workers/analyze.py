@@ -41,14 +41,16 @@ def _bytes_to_embedding(data: bytes) -> np.ndarray:
 
 
 def _compute_percentiles(values: list[float]) -> dict:
-    """Compute p25/p50/p75 for a list of values."""
+    """Compute p5/p25/p50/p75/p95 for a list of values."""
     if not values:
-        return {"p25": 0, "p50": 0, "p75": 0}
+        return {"p5": 0, "p25": 0, "p50": 0, "p75": 0, "p95": 0}
     arr = np.array(values)
     return {
+        "p5": float(np.percentile(arr, 5)),
         "p25": float(np.percentile(arr, 25)),
         "p50": float(np.percentile(arr, 50)),
         "p75": float(np.percentile(arr, 75)),
+        "p95": float(np.percentile(arr, 95)),
     }
 
 
@@ -139,7 +141,7 @@ def run_analysis(track_id: str) -> None:
             local_path = Path(tmp) / filename
             download_to_path(s3_key, local_path)
 
-            from app.engine.pipeline import load_mono, _extra_features, _slice_by_bpm_fallback
+            from app.engine.pipeline import load_mono, _extra_features, _slice_by_bpm_fallback, BatchFeatureExtractor
             from app.engine.tempo_bars import detect_beats_bpm_key, slice_by_bars_from_beats
             from app.engine.embeddings import embed_audio_batch, _resample_to_48k
             from app.engine.spectral import (
@@ -241,18 +243,27 @@ def run_analysis(track_id: str) -> None:
                         continue
                     raw_segments.append((seg, s, e, b0, b1, bars, s_i, e_i))
 
+            # Batch feature extraction: one STFT/HPSS for the whole track
+            batch_fx = BatchFeatureExtractor(y, sr)
+
+            # Full-track onset strength (computed once, sliced per segment)
+            _full_onset_env = _lr.onset.onset_strength(y=y, sr=sr, hop_length=512)
+            _onset_hop = 512
+
             # Pass 1: percentiles (mix + stems)
             all_rms, all_onset, all_hf, pre_feats = [], [], [], []
             all_stem_energies = []
             for (seg, s, e, b0, b1, bars, s_i, e_i) in raw_segments:
-                feats = _extra_features(seg, sr)
-                onset_env = _lr.onset.onset_strength(y=seg, sr=sr)
-                onset_d = float(onset_env.mean())
+                feats = batch_fx.extract(s_i, e_i)
+                # Slice pre-computed onset envelope
+                of_start = s_i // _onset_hop
+                of_end = max(e_i // _onset_hop, of_start + 1)
+                onset_seg = _full_onset_env[of_start:of_end]
+                onset_d = float(onset_seg.mean()) if onset_seg.size > 0 else 0.0
                 all_rms.append(feats["rms_dbfs"])
                 all_onset.append(onset_d)
                 all_hf.append(feats["hf_perc_ratio"])
                 pre_feats.append((feats, onset_d))
-                # Per-stem energy for this section
                 se = compute_stem_energies(stems, sr, s_i, e_i) if stems else {}
                 all_stem_energies.append(se)
 
@@ -260,7 +271,7 @@ def run_analysis(track_id: str) -> None:
             onset_pct = _compute_percentiles(all_onset)
             hf_pct = _compute_percentiles(all_hf)
 
-            # Stem percentiles (track-wide)
+            # Stem percentiles (track-wide, using p5/p95 for robust range)
             stem_pct = {}
             for sname in STEM_NAMES:
                 vals = [se.get(sname, -96) for se in all_stem_energies if se.get(sname, -96) > -90]
@@ -269,10 +280,6 @@ def run_analysis(track_id: str) -> None:
 
             # Pass 2: full features
             seg_meta = []
-            mix_clap_segments = []
-            mix_clap_indices = []
-            sr_48k = 48000
-            y_48k = _resample_to_48k(y, sr)
 
             # Collect all features first (labeling deferred for trajectory)
             seg_features = []
@@ -304,15 +311,13 @@ def run_analysis(track_id: str) -> None:
             for idx, sf in enumerate(seg_features):
                 by_bars.setdefault(sf["bars"], []).append(idx)
 
-            MIN_STEM_RANGE = 8.0
-
             def _stem_norm(val, sp_data):
-                s_p25 = sp_data.get("p25", -40)
-                s_p75 = sp_data.get("p75", -10)
-                s_range = s_p75 - s_p25
-                if s_range < MIN_STEM_RANGE:
-                    return -1.0
-                return (val - s_p25) / s_range
+                s_lo = sp_data.get("p5", -40)
+                s_hi = sp_data.get("p95", -10)
+                s_range = s_hi - s_lo
+                if s_range < 1.0:
+                    return 0.0  # stem is essentially constant
+                return (val - s_lo) / s_range
 
             # Label with classifier + trajectory per bar-size group
             for bars_key, indices in by_bars.items():
@@ -378,25 +383,7 @@ def run_analysis(track_id: str) -> None:
             for sf in seg_features:
                 seg_meta.append(sf)
 
-            # Build CLAP segments from pre-resampled audio
-            for idx, sf in enumerate(seg_meta):
-                s_48 = int(round(sf["start_s"] * sr_48k))
-                e_48 = int(round(sf["end_s"] * sr_48k))
-                mix_seg_48 = y_48k[s_48:e_48]
-                if mix_seg_48.shape[0] >= sr_48k:
-                    mix_clap_segments.append(mix_seg_48)
-                    mix_clap_indices.append(idx)
-
             print(f"[analyze] features: {_time.monotonic()-t3:.1f}s ({len(raw_segments)} segments)", flush=True)
-
-            # --- Step 4: PHASE 1 CLAP -- mix only ---
-            t4 = _time.monotonic()
-            mix_embeddings = [None] * len(seg_meta)
-            if mix_clap_segments:
-                embs = embed_audio_batch(mix_clap_segments, 48000)
-                for j, idx in enumerate(mix_clap_indices):
-                    mix_embeddings[idx] = embs[j]
-            print(f"[analyze] CLAP mix ({len(mix_clap_segments)} segments): {_time.monotonic()-t4:.1f}s", flush=True)
 
             # --- Step 5: PHASE 1 PERSIST -- mark as READY ---
             with SyncSession() as db:
@@ -419,7 +406,7 @@ def run_analysis(track_id: str) -> None:
 
                         section = TrackSection(
                             track_id=uuid.UUID(track_id),
-                            embedding=_embedding_to_bytes(mix_embeddings[i]) if mix_embeddings[i] is not None else None,
+                            embedding=None,  # deferred to Phase 2
                             eq_profile=_embedding_to_bytes(eq_avg),
                             eq_profile_peak=_embedding_to_bytes(eq_peak),
                             eq_profile_variance=_embedding_to_bytes(eq_var),
@@ -432,12 +419,31 @@ def run_analysis(track_id: str) -> None:
             print(f"[analyze] PHASE 1 DONE: {filename}: {len(seg_meta)} sections, "
                   f"mastering={mastering_state}, total={phase1_time:.1f}s", flush=True)
 
-            # --- PHASE 2: Stem embeddings (track already READY) ---
-            if not stems:
-                print(f"[analyze] PHASE 2 skipped: no stems", flush=True)
-                return
-
+            # --- PHASE 2: Mix + Stem CLAP embeddings (track already READY) ---
             t6 = _time.monotonic()
+            sr_48k = 48000
+            y_48k = _resample_to_48k(y, sr)
+
+            # Mix CLAP
+            mix_clap_segments = []
+            mix_clap_indices = []
+            for idx, (seg, s, e, b0, b1, bars, s_i, e_i) in enumerate(raw_segments):
+                s_48 = int(round(s * sr_48k))
+                e_48 = int(round(e * sr_48k))
+                mix_seg_48 = y_48k[s_48:e_48]
+                if mix_seg_48.shape[0] >= sr_48k:
+                    mix_clap_segments.append(mix_seg_48)
+                    mix_clap_indices.append(idx)
+
+            mix_embeddings = {}
+            if mix_clap_segments:
+                embs = embed_audio_batch(mix_clap_segments, 48000)
+                for j, idx in enumerate(mix_clap_indices):
+                    mix_embeddings[idx] = embs[j]
+            print(f"[analyze] CLAP mix ({len(mix_clap_segments)} segments): {_time.monotonic()-t6:.1f}s", flush=True)
+
+            # Stem CLAP
+            t7 = _time.monotonic()
             stems_48k = {}
             for name in STEM_NAMES:
                 if name in stems:
@@ -461,9 +467,9 @@ def run_analysis(track_id: str) -> None:
                 for emb_idx, (stem_name, seg_idx) in enumerate(stem_clap_map):
                     stem_embeddings[stem_name][seg_idx] = all_stem_embs[emb_idx]
 
-            print(f"[analyze] CLAP stems ({len(stem_clap_segments)} segments): {_time.monotonic()-t6:.1f}s", flush=True)
+            print(f"[analyze] CLAP stems ({len(stem_clap_segments)} segments): {_time.monotonic()-t7:.1f}s", flush=True)
 
-            # Update sections with stem embeddings
+            # Update sections with mix + stem embeddings
             with SyncSession() as db:
                 result = db.execute(
                     select(TrackSection).where(TrackSection.track_id == uuid.UUID(track_id))
@@ -471,6 +477,8 @@ def run_analysis(track_id: str) -> None:
                 )
                 sections = result.scalars().all()
                 for i, section in enumerate(sections):
+                    if i in mix_embeddings:
+                        section.embedding = _embedding_to_bytes(mix_embeddings[i])
                     for name in STEM_NAMES:
                         if i in stem_embeddings.get(name, {}):
                             setattr(section, f"embedding_{name}",
@@ -478,7 +486,7 @@ def run_analysis(track_id: str) -> None:
                 db.commit()
 
             total = _time.monotonic() - t0
-            print(f"[analyze] PHASE 2 DONE: stems complete, total={total:.1f}s", flush=True)
+            print(f"[analyze] PHASE 2 DONE: all embeddings complete, total={total:.1f}s", flush=True)
 
     except Exception as exc:
         _sync_update_status(track_id, TrackStatus.FAILED, error=str(exc))

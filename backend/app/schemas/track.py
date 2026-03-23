@@ -95,6 +95,56 @@ class SearchResponse(BaseModel):
     results: list[SearchWindowResult]
 
 
+class ReferenceCoachMatch(BaseModel):
+    track_id: uuid.UUID
+    filename: str
+    section_id: uuid.UUID
+    start_s: float
+    end_s: float
+    bars: int
+    bar_start: int
+    bar_end: int
+    bpm: float | None = None
+    key: str | None = None
+    scale: str | None = None
+    section_label: str | None = None
+    similarity: float
+    match_basis: str = "any_label"
+
+
+class ReferenceCoachSection(BaseModel):
+    query_section_id: uuid.UUID
+    query_start_s: float
+    query_end_s: float
+    query_bar_start: int
+    query_bar_end: int
+    query_section_label: str | None = None
+    query_section_label_confidence: float | None = None
+    anchor_match: ReferenceCoachMatch | None = None
+    alternate_matches: list[ReferenceCoachMatch] = []
+
+
+class ReferenceCoachAnchor(BaseModel):
+    track_id: uuid.UUID
+    filename: str
+    mastering_state: str | None = None
+    avg_similarity: float
+    coverage_ratio: float
+    matched_sections: int
+
+
+class ReferenceCoachResponse(BaseModel):
+    track_id: uuid.UUID
+    bars: int
+    mastering_state: str | None = None
+    matching_ready: bool
+    pending_embedding_sections: int
+    total_sections: int
+    matched_sections: int
+    anchor_track: ReferenceCoachAnchor | None = None
+    sections: list[ReferenceCoachSection] = []
+
+
 class TextSearchMatch(BaseModel):
     track_id: uuid.UUID
     filename: str

@@ -11,6 +11,7 @@ export interface Track {
   beats_per_bar: number | null;
   status: string;
   error_message: string | null;
+  mastering_state: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -37,6 +38,7 @@ export interface TrackSection {
   band_crest: Record<string, number> | null;
   band_transient_density: Record<string, number> | null;
   stereo_features: { correlation: number; mid_side_ratio: number; width_by_band: Record<string, number> } | null;
+  stem_energies?: Record<string, number> | null;
 }
 
 export interface EnergyCurve {
@@ -86,6 +88,56 @@ export interface SearchResponse {
   results: SearchWindowResult[];
 }
 
+export interface ReferenceCoachMatch {
+  track_id: string;
+  filename: string;
+  section_id: string;
+  start_s: number;
+  end_s: number;
+  bars: number;
+  bar_start: number;
+  bar_end: number;
+  bpm: number | null;
+  key: string | null;
+  scale: string | null;
+  section_label: string | null;
+  similarity: number;
+  match_basis: string;
+}
+
+export interface ReferenceCoachSection {
+  query_section_id: string;
+  query_start_s: number;
+  query_end_s: number;
+  query_bar_start: number;
+  query_bar_end: number;
+  query_section_label: string | null;
+  query_section_label_confidence: number | null;
+  anchor_match: ReferenceCoachMatch | null;
+  alternate_matches: ReferenceCoachMatch[];
+}
+
+export interface ReferenceCoachAnchor {
+  track_id: string;
+  filename: string;
+  mastering_state: string | null;
+  avg_similarity: number;
+  coverage_ratio: number;
+  matched_sections: number;
+}
+
+export interface ReferenceCoachResponse {
+  track_id: string;
+  bars: number;
+  mastering_state: string | null;
+  matching_ready: boolean;
+  pending_embedding_sections: number;
+  total_sections: number;
+  matched_sections: number;
+  anchor_track: ReferenceCoachAnchor | null;
+  sections: ReferenceCoachSection[];
+}
+
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, options);
   if (!res.ok) {
@@ -123,9 +175,14 @@ export async function getTrackEnergy(id: string): Promise<TrackWithCurve> {
   return request(`/tracks/${id}/energy`);
 }
 
+export async function getReferenceCoach(id: string, bars: number = 8, alternates: number = 2): Promise<ReferenceCoachResponse> {
+  return request(`/search/reference-coach/${id}?bars=${bars}&alternates=${alternates}`);
+}
+
 export interface ComparisonRecommendation {
   band?: string;
   freq_range?: string;
+  stem?: string;
   type: string;
   message: string;
   severity: string;
@@ -145,6 +202,11 @@ export interface ComparisonResult {
   stereo_a: Record<string, unknown>;
   stereo_b: Record<string, unknown>;
   dynamics_delta: { rms_dbfs: number; peak_dbfs: number; crest_db: number };
+  section_label_a?: string | null;
+  section_label_b?: string | null;
+  stem_energies_a?: Record<string, number>;
+  stem_energies_b?: Record<string, number>;
+  stem_balance_delta?: Record<string, number>;
   recommendations: ComparisonRecommendation[];
 }
 

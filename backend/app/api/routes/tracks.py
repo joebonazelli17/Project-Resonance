@@ -90,7 +90,6 @@ async def relabel_track(track_id: uuid.UUID, db: AsyncSession = Depends(get_db))
         raise HTTPException(404, "Track not found")
 
     duration = track.duration_s or 1.0
-    MIN_STEM_RANGE = 8.0
 
     # Group sections by bar size
     by_bars: dict[int, list[TrackSection]] = {}
@@ -107,11 +106,15 @@ async def relabel_track(track_id: uuid.UUID, db: AsyncSession = Depends(get_db))
     for stem in ["drums", "bass", "vocals", "other"]:
         vals = [s.stem_energies.get(stem, -96) for s in track.sections
                 if s.stem_energies and s.stem_energies.get(stem, -96) > -90]
-        stem_pcts[stem] = _pct(vals) if vals else {"p25": -40, "p50": -25, "p75": -10}
+        stem_pcts[stem] = _pct(vals) if vals else {"p5": -40, "p25": -30, "p50": -25, "p75": -15, "p95": -10}
 
     def snorm(val, sp):
-        sr = sp["p75"] - sp["p25"]
-        return -1.0 if sr < MIN_STEM_RANGE else (val - sp["p25"]) / sr
+        s_lo = sp.get("p5", -40)
+        s_hi = sp.get("p95", -10)
+        s_range = s_hi - s_lo
+        if s_range < 1.0:
+            return 0.0
+        return (val - s_lo) / s_range
 
     updated = 0
     for bars_key, secs_list in by_bars.items():
@@ -162,10 +165,16 @@ async def relabel_all_tracks(db: AsyncSession = Depends(get_db)):
 
 def _pct(vals):
     if not vals:
-        return {"p25": 0, "p50": 0, "p75": 0}
-    s = sorted(vals)
-    n = len(s)
-    return {"p25": s[n // 4], "p50": s[n // 2], "p75": s[3 * n // 4]}
+        return {"p5": 0, "p25": 0, "p50": 0, "p75": 0, "p95": 0}
+    import numpy as _np
+    arr = _np.array(vals)
+    return {
+        "p5": float(_np.percentile(arr, 5)),
+        "p25": float(_np.percentile(arr, 25)),
+        "p50": float(_np.percentile(arr, 50)),
+        "p75": float(_np.percentile(arr, 75)),
+        "p95": float(_np.percentile(arr, 95)),
+    }
 
 
 @router.get("", response_model=list[TrackOut])
